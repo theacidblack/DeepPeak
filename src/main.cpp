@@ -1,0 +1,692 @@
+// DeepPeak - a tiny Windows tray widget that shows when DeepSeek V4.1 Flash is
+// billed at peak vs off-peak rates (OpenCode Go / CommandCode GOAT passthrough).
+//
+// Peak: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday. Everything else,
+// including all weekend, is off-peak. Peak tokens cost exactly 2x.
+//
+// All peak math is done in UTC. Local time is only used for display, so DST
+// (Kyiv +2 winter / +3 summer) is handled by Windows automatically.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <ctime>
+#include <string>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "advapi32.lib")
+
+// ---------------------------------------------------------------- constants
+
+static const wchar_t kAppName[]   = L"DeepPeak";
+static const wchar_t kClassPanel[] = L"DeepPeakPanel";
+static const wchar_t kRunKey[]    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static const UINT WM_TRAYICON = WM_APP + 1;
+static const UINT_PTR kTimerId = 1;
+
+enum MenuId {
+    kMenuToggle  = 1001,
+    kMenuStartup = 1002,
+    kMenuCopy    = 1003,
+    kMenuExit    = 1004
+};
+
+// Classic dark palette
+static const COLORREF kBg     = RGB(0x16, 0x18, 0x1D);
+static const COLORREF kBorder = RGB(0x2A, 0x2F, 0x3A);
+static const COLORREF kText   = RGB(0xE8, 0xEA, 0xED);
+static const COLORREF kMuted  = RGB(0x8B, 0x94, 0xA3);
+static const COLORREF kGreen  = RGB(0x34, 0xD3, 0x99);
+static const COLORREF kRed    = RGB(0xF8, 0x71, 0x71);
+
+// Peak windows, minutes after UTC midnight
+static const int kPeak1Start = 1 * 60,  kPeak1End = 4 * 60;
+static const int kPeak2Start = 6 * 60,  kPeak2End = 10 * 60;
+
+// ------------------------------------------------------------------ globals
+
+static HINSTANCE g_inst;
+static HWND      g_hwnd;
+static HICON     g_iconPeak;
+static HICON     g_iconOff;
+static bool      g_peak = false;
+static bool      g_panelVisible = false;
+static bool      g_startupOn = false;
+static std::wstring g_lastTip;
+static HFONT     g_fCaption;
+static HFONT     g_fBig;
+static HFONT     g_fBody;
+static HFONT     g_fSmall;
+static int       g_dpi = 96;
+static RECT      g_panelRect = {0, 0, 0, 0};
+static bool      g_panelPlaced = false;
+
+static int S(int px) { return MulDiv(px, g_dpi, 96); }
+
+// -------------------------------------------------------------- peak logic
+
+struct Status {
+    bool   peak;
+    time_t next;        // UTC epoch of the next flip
+    int    secondsLeft;
+};
+
+static bool IsPeak(time_t t) {
+    struct tm g;
+    if (gmtime_s(&g, &t) != 0) return false;
+    if (g.tm_wday == 0 || g.tm_wday == 6) return false;  // weekend
+    const int m = g.tm_hour * 60 + g.tm_min;
+    return (m >= kPeak1Start && m < kPeak1End) ||
+           (m >= kPeak2Start && m < kPeak2End);
+}
+
+static Status ComputeStatus() {
+    Status s;
+    const time_t now = time(nullptr);
+    s.peak = IsPeak(now);
+
+    // Step forward minute-aligned until the state flips (max 8 days).
+    time_t t = now - (now % 60) + 60;
+    const time_t limit = now + 8 * 86400;
+    while (t < limit && IsPeak(t) == s.peak) t += 60;
+
+    s.next = t;
+    s.secondsLeft = (int)(t - now);
+    if (s.secondsLeft < 0) s.secondsLeft = 0;
+    return s;
+}
+
+// -------------------------------------------------------------- formatting
+
+static std::wstring FormatDuration(int sec) {
+    wchar_t buf[64];
+    if (sec < 60) return L"<1m";
+    const int totalMin = sec / 60;
+    const int h = totalMin / 60;
+    const int m = totalMin % 60;
+    if (h > 0) swprintf_s(buf, L"%dh %02dm", h, m);
+    else       swprintf_s(buf, L"%dm", m);
+    return buf;
+}
+
+static std::wstring LocalClock(time_t t) {
+    struct tm lt;
+    if (localtime_s(&lt, &t) != 0) return L"--:--";
+    wchar_t buf[16];
+    swprintf_s(buf, L"%02d:%02d", lt.tm_hour, lt.tm_min);
+    return buf;
+}
+
+static std::wstring LocalWhen(time_t t) {
+    static const wchar_t* kDays[] = {L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat"};
+    const time_t now = time(nullptr);
+    struct tm a, b;
+    if (localtime_s(&a, &now) != 0 || localtime_s(&b, &t) != 0) return LocalClock(t);
+    const bool sameDay = (a.tm_year == b.tm_year && a.tm_yday == b.tm_yday);
+    if (sameDay) return LocalClock(t);
+    return std::wstring(kDays[b.tm_wday]) + L" " + LocalClock(t);
+}
+
+// Peak schedule rendered in the user's current local time (handles DST).
+static std::wstring LocalSchedule() {
+    const time_t now = time(nullptr);
+    struct tm g;
+    if (gmtime_s(&g, &now) != 0) return L"";
+    g.tm_hour = 0; g.tm_min = 0; g.tm_sec = 0;
+    const time_t midnight = _mkgmtime(&g);
+
+    const std::wstring a1 = LocalClock(midnight + kPeak1Start * 60);
+    const std::wstring a2 = LocalClock(midnight + kPeak1End * 60);
+    const std::wstring b1 = LocalClock(midnight + kPeak2Start * 60);
+    const std::wstring b2 = LocalClock(midnight + kPeak2End * 60);
+    return L"Peak Mon-Fri " + a1 + L"-" + a2 + L", " + b1 + L"-" + b2;
+}
+
+// --------------------------------------------------------------- resources
+
+// Draws an anti-aliased filled circle into a 32-bit icon with an alpha channel.
+static HICON MakeDotIcon(int size, COLORREF c) {
+    BITMAPV5HEADER bi = {};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = size;
+    bi.bV5Height = -size;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask   = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask  = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&bi),
+                                     DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!color || !bits) {
+        if (color) DeleteObject(color);
+        DeleteDC(dc);
+        return nullptr;
+    }
+
+    BYTE* px = static_cast<BYTE*>(bits);
+    const double cx = size / 2.0;
+    const double cy = size / 2.0;
+    const double radius = size * 0.45;
+    const double r2 = radius * radius;
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            const double dx = x + 0.5 - cx;
+            const double dy = y + 0.5 - cy;
+            const double d2 = dx * dx + dy * dy;
+
+            // 1px soft edge for anti-aliasing
+            double coverage = 1.0;
+            if (d2 > r2) {
+                const double d = d2 > 0.0 ? (d2 - r2) : 0.0;
+                coverage = 1.0 - d / (radius * 2.0);
+            }
+            if (coverage < 0.0) coverage = 0.0;
+
+            const BYTE a = static_cast<BYTE>(coverage * 255.0 + 0.5);
+
+            BYTE* p = px + (y * size + x) * 4;
+            // premultiplied BGRA, which is what CreateIconIndirect expects
+            p[0] = static_cast<BYTE>(GetBValue(c) * a / 255);
+            p[1] = static_cast<BYTE>(GetGValue(c) * a / 255);
+            p[2] = static_cast<BYTE>(GetRValue(c) * a / 255);
+            p[3] = a;
+        }
+    }
+
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    ICONINFO ii = {};
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = color;
+    HICON icon = CreateIconIndirect(&ii);
+
+    DeleteObject(color);
+    DeleteObject(mask);
+    DeleteDC(dc);
+    return icon;
+}
+
+static void CreateFonts() {
+    const wchar_t* face = L"Segoe UI";
+    g_fCaption = CreateFontW(-S(9), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+    g_fBig     = CreateFontW(-S(23), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+    g_fBody    = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+    g_fSmall   = CreateFontW(-S(9), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+}
+
+static void DestroyFonts() {
+    if (g_fCaption) DeleteObject(g_fCaption);
+    if (g_fBig)     DeleteObject(g_fBig);
+    if (g_fBody)    DeleteObject(g_fBody);
+    if (g_fSmall)   DeleteObject(g_fSmall);
+}
+
+// ------------------------------------------------------------------ tray
+
+static std::wstring BuildTip(const Status& s) {
+    std::wstring text = s.peak
+        ? L"DeepPeak - PEAK 2x - expensive for " + FormatDuration(s.secondsLeft)
+        : L"DeepPeak - OFF-PEAK 1x - cheap for " + FormatDuration(s.secondsLeft);
+    if (text.size() > 120) text.resize(120);
+    return text;
+}
+
+static void UpdateTray(bool force) {
+    const Status s = ComputeStatus();
+    const std::wstring tip = BuildTip(s);
+    if (!force && tip == g_lastTip && s.peak == g_peak) return;
+    g_lastTip = tip;
+
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_TIP;
+    if (s.peak != g_peak) {
+        g_peak = s.peak;
+        nid.uFlags |= NIF_ICON;
+        nid.hIcon = g_peak ? g_iconPeak : g_iconOff;
+    }
+    wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+    if (g_panelVisible) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void AddTrayIcon() {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = g_peak ? g_iconPeak : g_iconOff;
+    wcsncpy_s(nid.szTip, BuildTip(ComputeStatus()).c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+// ------------------------------------------------------------- autostart
+
+static std::wstring ExePath() {
+    wchar_t buf[MAX_PATH * 2] = {};
+    GetModuleFileNameW(nullptr, buf, ARRAYSIZE(buf));
+    return buf;
+}
+
+static bool StartupEnabled() {
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD bytes = sizeof(buf);
+    DWORD type = 0;
+    const bool ok = RegQueryValueExW(key, kAppName, nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &bytes) == ERROR_SUCCESS;
+    RegCloseKey(key);
+    return ok && bytes > 0;
+}
+
+static void SetStartup(bool on) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        const std::wstring value = L"\"" + ExePath() + L"\"";
+        RegSetValueExW(key, kAppName, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(value.c_str()),
+                       static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, kAppName);
+    }
+    RegCloseKey(key);
+}
+
+// ------------------------------------------------------------------ drawing
+
+static void FillRoundRect(HDC dc, const RECT& r, int radius, COLORREF color) {
+    HBRUSH br = CreateSolidBrush(color);
+    HGDIOBJ oldBrush = SelectObject(dc, br);
+    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(br);
+}
+
+static void DrawTextIn(HDC dc, const std::wstring& text, RECT r, HFONT font,
+                       COLORREF color, UINT flags) {
+    SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), -1, &r, flags);
+}
+
+// 24h strip: one slot per half hour, green = cheap, red = peak.
+static void DrawTimeline(HDC dc, const RECT& bar, time_t now) {
+    const int kSlots = 48;
+    const int kSlotSecs = 1800;
+
+    HRGN clip = CreateRoundRectRgn(bar.left, bar.top, bar.right + 1, bar.bottom + 1,
+                                   bar.bottom - bar.top, bar.bottom - bar.top);
+    SelectClipRgn(dc, clip);
+    HBRUSH cheap = CreateSolidBrush(RGB(0x2E, 0x6D, 0x53));
+    HBRUSH peak = CreateSolidBrush(RGB(0x78, 0x32, 0x38));
+    const double step = (bar.right - bar.left) / static_cast<double>(kSlots);
+    for (int i = 0; i < kSlots; ++i) {
+        RECT seg;
+        seg.left = bar.left + static_cast<LONG>(i * step);
+        seg.right = bar.left + static_cast<LONG>((i + 1) * step) + 1;
+        seg.top = bar.top;
+        seg.bottom = bar.bottom;
+        FillRect(dc, &seg, IsPeak(now + i * kSlotSecs) ? peak : cheap);
+    }
+    DeleteObject(cheap);
+    DeleteObject(peak);
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(clip);
+}
+
+static void PaintPanel(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int w = rc.right, h = rc.bottom;
+
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP back = CreateCompatibleBitmap(dc, w, h);
+    HGDIOBJ oldBitmap = SelectObject(mem, back);
+
+    const Status st = ComputeStatus();
+    const COLORREF accent = st.peak ? kRed : kGreen;
+
+    FillRoundRect(mem, rc, S(14), kBorder);
+    RECT inner = {S(1), S(1), w - S(1), h - S(1)};
+    FillRoundRect(mem, inner, S(13), kBg);
+
+    const int pad = S(18);
+    const int right = w - pad;
+
+    // Header
+    RECT header = {pad, S(14), right - S(52), S(30)};
+    DrawTextIn(mem, L"DEEPSEEK V4.1 FLASH", header, g_fCaption, kMuted,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // Cost chip
+    const std::wstring chip = st.peak ? L"2x" : L"1x";
+    SelectObject(mem, g_fCaption);
+    SIZE chipSize = {0, 0};
+    GetTextExtentPoint32W(mem, chip.c_str(), static_cast<int>(chip.size()), &chipSize);
+    const int chipW = chipSize.cx + S(20);
+    const int chipH = S(19);
+    RECT chipRc = {right - chipW, S(11), right, S(11) + chipH};
+    FillRoundRect(mem, chipRc, S(9),
+                  st.peak ? RGB(0x3C, 0x22, 0x26) : RGB(0x18, 0x3A, 0x30));
+    DrawTextIn(mem, chip, chipRc, g_fCaption, accent,
+               DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    // Status
+    RECT statusRc = {pad, S(32), right, S(66)};
+    DrawTextIn(mem, st.peak ? L"PEAK" : L"OFF-PEAK", statusRc, g_fBig, accent,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // Time left in this price tier
+    const std::wstring head = st.peak
+        ? L"Expensive for " + FormatDuration(st.secondsLeft)
+        : L"Cheap for " + FormatDuration(st.secondsLeft);
+    RECT leftRc = {pad, S(66), right, S(86)};
+    DrawTextIn(mem, head, leftRc, g_fBody, kText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // What happens next
+    const std::wstring nextLine = st.peak
+        ? L"Cheap price returns " + LocalWhen(st.next)
+        : L"Peak price starts " + LocalWhen(st.next);
+    RECT nextRc = {pad, S(86), right, S(102)};
+    DrawTextIn(mem, nextLine, nextRc, g_fSmall, kMuted,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // 24h timeline
+    RECT bar = {pad, S(108), right, S(116)};
+    DrawTimeline(mem, bar, time(nullptr));
+    RECT lblL = {pad, S(114), pad + S(40), S(128)};
+    DrawTextIn(mem, L"now", lblL, g_fSmall, RGB(0x64, 0x6C, 0x7B),
+               DT_LEFT | DT_SINGLELINE | DT_TOP);
+    RECT lblR = {right - S(40), S(114), right, S(128)};
+    DrawTextIn(mem, L"+24h", lblR, g_fSmall, RGB(0x64, 0x6C, 0x7B),
+               DT_RIGHT | DT_SINGLELINE | DT_TOP);
+
+    // Divider
+    RECT div = {pad, S(132), right, S(133)};
+    HBRUSH divBr = CreateSolidBrush(RGB(0x24, 0x28, 0x31));
+    FillRect(mem, &div, divBr);
+    DeleteObject(divBr);
+
+    // Footer
+    RECT f1 = {pad, S(138), right, S(154)};
+    DrawTextIn(mem, LocalSchedule(), f1, g_fSmall, kMuted,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    RECT f2 = {pad, S(152), right, S(168)};
+    DrawTextIn(mem, L"Local time - weekends are always off-peak", f2, g_fSmall,
+               RGB(0x64, 0x6C, 0x7B), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldBitmap);
+    DeleteObject(back);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
+// ------------------------------------------------------------------- panel
+
+static void ShowPanel(bool show) {
+    if (show) {
+        if (!g_panelPlaced) {
+            POINT pt;
+            GetCursorPos(&pt);
+            MONITORINFO mi = {sizeof(mi)};
+            HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            GetMonitorInfoW(mon, &mi);
+            RECT wr;
+            GetWindowRect(g_hwnd, &wr);
+            const int w = wr.right - wr.left, h = wr.bottom - wr.top;
+            int x = pt.x + S(8);
+            int y = pt.y - h - S(8);
+            if (x + w > mi.rcWork.right) x = mi.rcWork.right - w - S(8);
+            if (y < mi.rcWork.top) y = mi.rcWork.top + S(8);
+            g_panelRect = {x, y, x + w, y + h};
+            g_panelPlaced = true;
+        }
+        SetWindowPos(g_hwnd, HWND_TOPMOST,
+                     g_panelRect.left, g_panelRect.top,
+                     g_panelRect.right - g_panelRect.left,
+                     g_panelRect.bottom - g_panelRect.top,
+                     SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    } else {
+        ShowWindow(g_hwnd, SW_HIDE);
+    }
+    g_panelVisible = show;
+}
+
+static void CopyStatusToClipboard() {
+    const Status st = ComputeStatus();
+    std::wstring text = st.peak ? L"PEAK" : L"OFF-PEAK";
+    text += st.peak ? L" (2x cost)" : L" (1x cost)";
+    text += st.peak ? L", peak ends " : L", peak starts ";
+    text += LocalWhen(st.next);
+    text += L" local. ";
+    text += LocalSchedule();
+
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (mem) {
+        void* dst = GlobalLock(mem);
+        if (dst) {
+            memcpy(dst, text.c_str(), bytes);
+            GlobalUnlock(mem);
+            SetClipboardData(CF_UNICODETEXT, mem);
+        } else {
+            GlobalFree(mem);
+        }
+    }
+    CloseClipboard();
+}
+
+static void ShowTrayMenu() {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, kMenuToggle, g_panelVisible ? L"Hide panel" : L"Show panel");
+    AppendMenuW(menu, MF_STRING, kMenuCopy, L"Copy status");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    g_startupOn = StartupEnabled();
+    AppendMenuW(menu, MF_STRING | (g_startupOn ? MF_CHECKED : 0), kMenuStartup,
+                L"Start with Windows");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_hwnd);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                    pt.x, pt.y, 0, g_hwnd, nullptr);
+    PostMessage(g_hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+
+    switch (cmd) {
+        case kMenuToggle:  ShowPanel(!g_panelVisible); break;
+        case kMenuCopy:    CopyStatusToClipboard();    break;
+        case kMenuStartup: SetStartup(!g_startupOn);   break;
+        case kMenuExit:    DestroyWindow(g_hwnd);      break;
+        default: break;
+    }
+}
+
+// ---------------------------------------------------------------- windows
+
+static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT:
+            PaintPanel(hwnd);
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_NCHITTEST:
+            return HTCAPTION;
+
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE && g_panelVisible)
+                ShowPanel(false);
+            return 0;
+
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) ShowPanel(false);
+            return 0;
+
+        case WM_TIMER:
+            if (wParam == kTimerId) UpdateTray(false);
+            return 0;
+
+        case WM_TIMECHANGE:
+        case WM_DISPLAYCHANGE:
+            UpdateTray(true);
+            return 0;
+
+        case WM_TRAYICON:
+            if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+                ShowPanel(!g_panelVisible);
+            } else if (lParam == WM_RBUTTONUP) {
+                if (g_panelVisible) ShowPanel(false);
+                ShowTrayMenu();
+            }
+            return 0;
+
+        case WM_CLOSE:
+            ShowPanel(false);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_dpi = 96;
+            HDC dc = GetDC(hwnd);
+            if (dc) {
+                g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
+                ReleaseDC(hwnd, dc);
+            }
+            CreateFonts();
+            SetTimer(hwnd, kTimerId, 1000, nullptr);
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            KillTimer(hwnd, kTimerId);
+            NOTIFYICONDATAW nid = {};
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            DestroyFonts();
+            PostQuitMessage(0);
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
+    g_inst = inst;
+
+    // Per-monitor DPI awareness (v2) when available.
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using SetCtxFn = BOOL(WINAPI*)(HANDLE);
+        auto setCtx = reinterpret_cast<SetCtxFn>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        if (setCtx) setCtx(reinterpret_cast<HANDLE>(-4));  // PER_MONITOR_AWARE_V2
+    }
+
+    // Single instance
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"DeepPeak.SingleInstance");
+    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+
+    g_iconPeak = MakeDotIcon(32, kRed);
+    g_iconOff  = MakeDotIcon(32, kGreen);
+    g_peak = ComputeStatus().peak;
+
+    WNDCLASSEXW wc = {sizeof(wc)};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = kAppName;
+    wc.hIcon = g_iconOff;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    WNDCLASSEXW pc = {sizeof(pc)};
+    pc.lpfnWndProc = PanelProc;
+    pc.hInstance = inst;
+    pc.lpszClassName = kClassPanel;
+    pc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    pc.hbrBackground = nullptr;
+    RegisterClassExW(&pc);
+
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kClassPanel, kAppName,
+                             WS_POPUP, 0, 0, 340, 180, nullptr, nullptr, inst, nullptr);
+    if (!g_hwnd) return 1;
+
+    // Scale the panel to the current DPI.
+    {
+        HDC dc = GetDC(g_hwnd);
+        if (dc) {
+            g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
+            ReleaseDC(g_hwnd, dc);
+        }
+        SetWindowPos(g_hwnd, nullptr, 0, 0, S(340), S(180),
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        HRGN region = CreateRoundRectRgn(0, 0, S(340) + 1, S(180) + 1, S(28), S(28));
+        SetWindowRgn(g_hwnd, region, TRUE);
+    }
+
+    AddTrayIcon();
+
+    // `--show` opens the panel immediately (handy for testing / shortcuts).
+    if (cmdLine && wcsstr(cmdLine, L"--show")) ShowPanel(true);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_iconPeak) DestroyIcon(g_iconPeak);
+    if (g_iconOff)  DestroyIcon(g_iconOff);
+    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
+    return 0;
+}
