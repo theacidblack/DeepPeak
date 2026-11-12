@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <ctime>
+#include <cstdio>
 #include <string>
 
 #pragma comment(lib, "user32.lib")
@@ -25,6 +26,7 @@ static const wchar_t kClassPanel[] = L"DeepPeakPanel";
 static const wchar_t kRunKey[]    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 static const UINT WM_TRAYICON = WM_APP + 1;
+static const UINT WM_TOGGLE   = WM_APP + 2;
 static const UINT_PTR kTimerId = 1;
 
 enum MenuId {
@@ -62,8 +64,21 @@ static HFONT     g_fBody;
 static HFONT     g_fSmall;
 static int       g_dpi = 96;
 static RECT      g_panelRect = {0, 0, 0, 0};
+static HHOOK     g_kbHook = nullptr;
+static DWORD     g_lastDChord = 0;
 static bool      g_panelPlaced = false;
 
+// Optional debug log: set DEEPPEAK_DEBUG=1 to write %TEMP%\DeepPeak.log
+static void LogDebug(const wchar_t* msg) {
+    wchar_t path[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"DEEPPEAK_DEBUG", nullptr, 0)) return;
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"DeepPeak.log");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+    fwprintf(f, L"%s\n", msg);
+    fclose(f);
+}
 static int S(int px) { return MulDiv(px, g_dpi, 96); }
 
 // -------------------------------------------------------------- peak logic
@@ -517,9 +532,40 @@ static void CopyStatusToClipboard() {
     CloseClipboard();
 }
 
+// Global Ctrl+D then Ctrl+P chord. RegisterHotKey cannot express a two-key
+// chord, so a low-level keyboard hook watches for it. The trailing P is
+// swallowed so it does not trigger a print dialog in the focused app.
+static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        const KBDLLHOOKSTRUCT* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+        const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+                          (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
+                          (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+
+        if (down && kb->vkCode == 'D' && ctrl) {
+            g_lastDChord = GetTickCount();
+        } else if (down && kb->vkCode == 'P' && ctrl) {
+            const DWORD now = GetTickCount();
+            if (g_lastDChord != 0 && now - g_lastDChord <= 800) {
+                g_lastDChord = 0;
+                LogDebug(L"chord: ctrl+d+p");
+                PostMessage(g_hwnd, WM_TOGGLE, 0, 0);
+                return 1;  // swallow P
+            }
+        } else if (up && (kb->vkCode == VK_CONTROL || kb->vkCode == VK_LCONTROL ||
+                          kb->vkCode == VK_RCONTROL)) {
+            g_lastDChord = 0;
+        }
+    }
+    return CallNextHookEx(g_kbHook, code, wParam, lParam);
+}
 static void ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kMenuToggle, g_panelVisible ? L"Hide panel" : L"Show panel");
+    AppendMenuW(menu, MF_STRING, kMenuToggle,
+                g_panelVisible ? L"Hide panel\tCtrl+D, P" : L"Show panel\tCtrl+D, P");
     AppendMenuW(menu, MF_STRING, kMenuCopy, L"Copy status");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     g_startupOn = StartupEnabled();
@@ -577,6 +623,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             UpdateTray(true);
             return 0;
 
+        case WM_TOGGLE:
+            LogDebug(L"toggle message");
+            ShowPanel(!g_panelVisible);
+            return 0;
+
         case WM_TRAYICON:
             if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
                 ShowPanel(!g_panelVisible);
@@ -609,6 +660,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_DESTROY: {
             KillTimer(hwnd, kTimerId);
+            if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
             NOTIFYICONDATAW nid = {};
             nid.cbSize = sizeof(nid);
             nid.hWnd = hwnd;
@@ -675,6 +727,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
 
     AddTrayIcon();
+
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, inst, 0);
+    if (!g_kbHook) LogDebug(L"hook install FAILED"); else LogDebug(L"hook installed");
 
     // `--show` opens the panel immediately (handy for testing / shortcuts).
     if (cmdLine && wcsstr(cmdLine, L"--show")) ShowPanel(true);

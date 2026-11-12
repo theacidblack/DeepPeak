@@ -6,6 +6,8 @@ A tiny Windows tray widget that tells you when DeepSeek V4.1 Flash is billed at
 Built for people running DeepSeek V4.1 Flash through **OpenCode Go** and
 **CommandCode GOAT**, both of which pass through DeepSeek's time-of-day pricing.
 
+![DeepPeak panel](docs/panel.png)
+
 ## Why it matters
 
 Peak tokens cost exactly **2x** off-peak tokens. Both subscriptions meter you in
@@ -34,6 +36,18 @@ automatically -- no hardcoded offset.
   - what happens next and at which local time
   - a 24-hour timeline strip so you can see the shape of the day at a glance
   - the peak schedule rendered in your local time
+- Global **Ctrl+D, P** hotkey to toggle the panel from anywhere.
+
+## Hotkey
+
+Press **Ctrl+D, then P** (hold Ctrl) anywhere in Windows to show or hide the
+panel. It is a real chord, not a single shortcut, so it does not clash with
+Ctrl+D or Ctrl+P on their own. The trailing P is swallowed so it cannot open a
+print dialog in the focused app.
+
+`RegisterHotKey` cannot register a two-key chord, so the app uses a low-level
+keyboard hook. It only watches for this sequence and never records or forwards
+anything else.
 
 ## Features
 
