@@ -177,9 +177,17 @@ tools/              icon generator and screenshot helper
 
 ## Memory
 
-- Private memory: ~2.5 MB
-- Working set: ~11 MB
-- One 1-second timer, no threads of its own, no network.
+Measured on Windows 11, idle, after a few hours:
+
+- Task Manager "Memory" (private working set): ~1.6 MB
+- Private commit: ~2.5 MB
+- Working set including shared DLLs: ~11-15 MB
+
+The working set number is larger only because the process maps the same Windows
+libraries every app uses (`user32`, `gdi32`, `shell32`, `winmm`, `dwmapi`); those
+pages are shared and are not extra RAM the system gives up for this app.
+
+One 1-second timer, no threads of its own, no network.
 
 ## Third-party resources
 
