@@ -968,42 +968,27 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             return 0;
 
         case WM_CLOSE:
-            ShowPanel(false);
+            DestroyWindow(hwnd);
             return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_CREATE: {
-            g_dpi = 96;
-            HDC dc = GetDC(hwnd);
-            if (dc) {
-                g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
-                ReleaseDC(hwnd, dc);
-            }
-            CreateFonts();
-            SetTimer(hwnd, kTimerId, 1000, nullptr);
-            return 0;
-        }
-
-        case WM_DESTROY: {
+        case WM_DESTROY:
             KillTimer(hwnd, kTimerId);
             if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
             StopNotification();
-            NOTIFYICONDATAW nid = {};
-            nid.cbSize = sizeof(nid);
-            nid.hWnd = hwnd;
-            nid.uID = 1;
-            Shell_NotifyIconW(NIM_DELETE, &nid);
+            {
+                NOTIFYICONDATAW nid = {};
+                nid.cbSize = sizeof(nid);
+                nid.hWnd = hwnd;
+                nid.uID = 1;
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+            }
             DestroyFonts();
             PostQuitMessage(0);
             return 0;
-        }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
+
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_inst = inst;
@@ -1014,6 +999,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         auto setCtx = reinterpret_cast<SetCtxFn>(
             GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
         if (setCtx) setCtx(reinterpret_cast<HANDLE>(-4));  // PER_MONITOR_AWARE_V2
+    }
+
+    // `--quit` asks a running copy to exit, used by the installer/uninstaller.
+    if (cmdLine && wcsstr(cmdLine, L"--quit")) {
+        HWND running = FindWindowW(kClassPanel, nullptr);
+        LogDebug(running ? L"quit: window found" : L"quit: no window");
+        if (running) PostMessageW(running, WM_CLOSE, 0, 0);
+        return 0;
     }
 
     // Single instance
@@ -1029,20 +1022,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_soundOn = LoadSoundSetting();
     HealStartupPath();
 
-    WNDCLASSEXW wc = {sizeof(wc)};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = inst;
-    wc.lpszClassName = kAppName;
-    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-    if (!wc.hIcon) wc.hIcon = g_iconOff;
-    wc.hIconSm = wc.hIcon;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    RegisterClassExW(&wc);
 
     WNDCLASSEXW pc = {sizeof(pc)};
     pc.lpfnWndProc = PanelProc;
     pc.hInstance = inst;
     pc.lpszClassName = kClassPanel;
+    pc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    if (!pc.hIcon) pc.hIcon = g_iconOff;
     pc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     pc.hbrBackground = nullptr;
     pc.style = CS_DROPSHADOW;
