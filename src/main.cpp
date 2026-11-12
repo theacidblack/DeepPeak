@@ -582,6 +582,27 @@ static void SetStartup(bool on) {
     RegCloseKey(key);
 }
 
+// If the exe was moved while autostart was on, rewrite the Run entry so the
+// next logon still finds it.
+static void HealStartupPath() {
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE | KEY_SET_VALUE,
+                      &key) != ERROR_SUCCESS)
+        return;
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD bytes = sizeof(buf), type = 0;
+    if (RegQueryValueExW(key, kAppName, nullptr, &type,
+                         reinterpret_cast<LPBYTE>(buf), &bytes) == ERROR_SUCCESS && bytes > 0) {
+        const std::wstring expected = L"\"" + ExePath() + L"\"";
+        if (expected != buf) {
+            RegSetValueExW(key, kAppName, 0, REG_SZ,
+                           reinterpret_cast<const BYTE*>(expected.c_str()),
+                           static_cast<DWORD>((expected.size() + 1) * sizeof(wchar_t)));
+            LogDebug(L"startup path repaired");
+        }
+    }
+    RegCloseKey(key);
+}
 // ------------------------------------------------------------- dwm / theme
 
 static void ApplyDwmTheme(HWND hwnd) {
@@ -1006,6 +1027,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_peak = ComputeStatus().peak;
     g_lastPeakState = g_peak;
     g_soundOn = LoadSoundSetting();
+    HealStartupPath();
 
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;

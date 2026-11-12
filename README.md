@@ -99,8 +99,15 @@ it together with the version info.
 .\build\DeepPeak.exe
 ```
 
-Add it to startup from the tray menu ("Start with Windows"), which writes a
-single `HKCU\...\CurrentVersion\Run` value.
+## Start with Windows
+
+Tray menu -> **Start with Windows** writes a single
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value
+(`"C:\path\to\DeepPeak.exe"`, quoted), so the app launches with your session and
+sits in the tray. Untick the same menu item to remove it.
+
+If the exe is moved while autostart is on, the app rewrites the Run entry to its
+new path on the next launch, so the setting does not rot.
 
 ## Development helpers
 
