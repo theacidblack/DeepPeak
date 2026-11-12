@@ -151,6 +151,7 @@ static bool      g_peak = false;
 static bool      g_panelVisible = false;
 static bool      g_startupOn = false;
 static std::wstring g_lastTip;
+static UINT      g_taskbarCreated = 0;
 static HFONT     g_fCaption;
 static HFONT     g_fStatus;
 static HFONT     g_fBody;
@@ -606,6 +607,8 @@ static int RunSelfTest() {
 }
 // ------------------------------------------------------------------ tray
 
+static void AddTrayIcon();
+
 static std::wstring BuildTip(const Status& s) {
     std::wstring text = s.peak
         ? L"DeepPeak - Peak 2x - expensive for " + FormatDuration(s.secondsLeft)
@@ -631,7 +634,14 @@ static void UpdateTray(bool force) {
         nid.hIcon = g_peak ? g_iconPeak : g_iconOff;
     }
     wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    if (!Shell_NotifyIconW(NIM_MODIFY, &nid)) {
+        // The shell dropped our icon (Explorer restart, shell glitch). Put it back.
+        wchar_t dbg[160] = {};
+        swprintf_s(dbg, L"tray modify failed (%lu), re-adding icon", GetLastError());
+        LogDebug(dbg);
+        AddTrayIcon();
+        g_lastTip.clear();
+    }
 
     if (g_panelVisible) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -1006,6 +1016,12 @@ static void ShowTrayMenu() {
 // ---------------------------------------------------------------- windows
 
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_taskbarCreated && msg == g_taskbarCreated) {
+        AddTrayIcon();
+        UpdateTray(true);
+        return 0;
+    }
+
     switch (msg) {
         case WM_PAINT:
             PaintPanel(hwnd);
@@ -1157,6 +1173,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     ApplyDwmTheme(g_hwnd);
 
     AddTrayIcon();
+
+    // The one-second tick that keeps tray text, icon colour, the panel countdown
+    // and the voice notification in step with the clock.
+    SetTimer(g_hwnd, kTimerId, 1000, nullptr);
+
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, inst, 0);
     if (!g_kbHook) LogDebug(L"hook install FAILED"); else LogDebug(L"hook installed");
