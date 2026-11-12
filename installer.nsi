@@ -18,6 +18,10 @@ SetCompressorDictSize 32
 !define PUBLISHER  "theacidblack"
 !define HOMEPAGE   "https://github.com/theacidblack/DeepPeak"
 !define REGKEY     "Software\${APPNAME}"
+!ifndef VERSION_NUM
+  !define VERSION_NUM "${VERSION}"
+!endif
+
 !define UNINSTKEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
 !define RUNKEY     "Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -28,7 +32,7 @@ InstallDir "$LOCALAPPDATA\Programs\${APPNAME}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel user
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${VERSION_NUM}.0"
 VIAddVersionKey "ProductName"     "${APPNAME}"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
 VIAddVersionKey "FileVersion"     "${VERSION}"

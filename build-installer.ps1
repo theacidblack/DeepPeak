@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-& (Join-Path $root 'build.ps1')
+& (Join-Path $root 'build.ps1') -Version $Version
 
 $makensis = $null
 foreach ($candidate in @(
@@ -26,7 +26,9 @@ New-Item -ItemType Directory -Force -Path (Join-Path $root 'dist') | Out-Null
 
 Write-Host ""
 Write-Host "Building installer $Version ..."
-& $makensis /V2 "/DVERSION=$Version" (Join-Path $root 'installer.nsi')
+$num = ($Version -split '-')[0]
+if ($num -notmatch '^\d+\.\d+\.\d+$') { $num = '0.0.0' }
+& $makensis /V2 "/DVERSION=$Version" "/DVERSION_NUM=$num" (Join-Path $root 'installer.nsi')
 if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
 
 $setup = Join-Path $root "dist\DeepPeak-$Version-setup.exe"
