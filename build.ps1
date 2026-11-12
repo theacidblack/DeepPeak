@@ -16,7 +16,7 @@ if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
 
 Push-Location $build
 try {
-    $cmd = "`"$vcvars`" >nul && cl /nologo /std:c++17 /O2 /MT /W4 /EHsc /DUNICODE /D_UNICODE `"$root\src\main.cpp`" /Fe:DeepPeak.exe /link /SUBSYSTEM:WINDOWS"
+    $cmd = "`"$vcvars`" >nul && rc /nologo /fo `"$build\app.res`" `"$root\app.rc`" && cl /nologo /std:c++17 /O2 /MT /W4 /EHsc /DUNICODE /D_UNICODE `"$root\src\main.cpp`" `"$build\app.res`" /Fe:DeepPeak.exe /link /SUBSYSTEM:WINDOWS"
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "compile failed with exit code $LASTEXITCODE" }
 } finally {

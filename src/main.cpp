@@ -4,12 +4,13 @@
 // Peak: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday. Everything else,
 // including all weekend, is off-peak. Peak tokens cost exactly 2x.
 //
-// All peak math is done in UTC. Local time is only used for display, so DST
-// (Kyiv +2 winter / +3 summer) is handled by Windows automatically.
+// All peak math is done in UTC. Local time is only used for display, so the
+// widget works in every time zone and follows DST automatically.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <dwmapi.h>
 #include <ctime>
 #include <cstdio>
 #include <string>
@@ -18,16 +19,22 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 // ---------------------------------------------------------------- constants
 
-static const wchar_t kAppName[]   = L"DeepPeak";
+static const wchar_t kAppName[]    = L"DeepPeak";
 static const wchar_t kClassPanel[] = L"DeepPeakPanel";
-static const wchar_t kRunKey[]    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunKey[]     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kPersonalize[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 
 static const UINT WM_TRAYICON = WM_APP + 1;
 static const UINT WM_TOGGLE   = WM_APP + 2;
 static const UINT_PTR kTimerId = 1;
+
+static const int kPanelW = 340;
+static const int kPanelH = 196;
 
 enum MenuId {
     kMenuToggle  = 1001,
@@ -36,17 +43,99 @@ enum MenuId {
     kMenuExit    = 1004
 };
 
-// Classic dark palette
-static const COLORREF kBg     = RGB(0x16, 0x18, 0x1D);
-static const COLORREF kBorder = RGB(0x2A, 0x2F, 0x3A);
-static const COLORREF kText   = RGB(0xE8, 0xEA, 0xED);
-static const COLORREF kMuted  = RGB(0x8B, 0x94, 0xA3);
-static const COLORREF kGreen  = RGB(0x34, 0xD3, 0x99);
-static const COLORREF kRed    = RGB(0xF8, 0x71, 0x71);
-
 // Peak windows, minutes after UTC midnight
 static const int kPeak1Start = 1 * 60,  kPeak1End = 4 * 60;
 static const int kPeak2Start = 6 * 60,  kPeak2End = 10 * 60;
+
+// DWM attributes (not in older SDK headers)
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_ROUND
+#define DWMWCP_ROUND 2
+#endif
+
+// ------------------------------------------------------------------ theme
+
+struct Theme {
+    bool     dark;
+    COLORREF bg;
+    COLORREF border;
+    COLORREF text;
+    COLORREF secondary;
+    COLORREF tertiary;
+    COLORREF divider;
+    COLORREF green;
+    COLORREF red;
+    COLORREF chipPeakBg;
+    COLORREF chipOffBg;
+};
+
+static Theme g_theme;
+
+static COLORREF Mix(COLORREF base, COLORREF over, double amount) {
+    const auto ch = [&](int a, int b) {
+        return static_cast<BYTE>(a + (b - a) * amount + 0.5);
+    };
+    return RGB(ch(GetRValue(base), GetRValue(over)),
+               ch(GetGValue(base), GetGValue(over)),
+               ch(GetBValue(base), GetBValue(over)));
+}
+
+static void ApplyPalette(bool dark);
+
+// Reads the Windows 11 app theme (Settings > Personalization > Colors).
+// DEEPPEAK_THEME=light|dark overrides it, which is handy for testing.
+static void LoadTheme() {
+    bool dark = false;
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kPersonalize, 0, KEY_QUERY_VALUE, &key) ==
+        ERROR_SUCCESS) {
+        DWORD value = 1, bytes = sizeof(value), type = 0;
+        if (RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(&value), &bytes) == ERROR_SUCCESS) {
+            dark = (value == 0);
+        }
+        RegCloseKey(key);
+    }
+
+    wchar_t forced[16] = {};
+    if (GetEnvironmentVariableW(L"DEEPPEAK_THEME", forced, 16)) {
+        if (_wcsicmp(forced, L"dark") == 0)  dark = true;
+        if (_wcsicmp(forced, L"light") == 0) dark = false;
+    }
+
+    ApplyPalette(dark);
+}
+
+// Windows 11 palette, light and dark.
+static void ApplyPalette(bool dark) {
+    g_theme.dark = dark;
+    if (dark) {
+        g_theme.bg        = RGB(0x20, 0x20, 0x20);
+        g_theme.border    = RGB(0x33, 0x33, 0x33);
+        g_theme.text      = RGB(0xFF, 0xFF, 0xFF);
+        g_theme.secondary = RGB(0xC5, 0xC5, 0xC5);
+        g_theme.tertiary  = RGB(0x9A, 0x9A, 0x9A);
+        g_theme.divider   = RGB(0x3A, 0x3A, 0x3A);
+        g_theme.green     = RGB(0x6C, 0xCB, 0x5F);
+        g_theme.red       = RGB(0xFF, 0x99, 0xA4);
+    } else {
+        g_theme.bg        = RGB(0xF9, 0xF9, 0xF9);
+        g_theme.border    = RGB(0xE3, 0xE3, 0xE3);
+        g_theme.text      = RGB(0x1A, 0x1A, 0x1A);
+        g_theme.secondary = RGB(0x5D, 0x5D, 0x5D);
+        g_theme.tertiary  = RGB(0x8A, 0x8A, 0x8A);
+        g_theme.divider   = RGB(0xE8, 0xE8, 0xE8);
+        g_theme.green     = RGB(0x0F, 0x7B, 0x0F);
+        g_theme.red       = RGB(0xC4, 0x2B, 0x1C);
+    }
+    g_theme.chipPeakBg = Mix(g_theme.bg, g_theme.red, 0.16);
+    g_theme.chipOffBg  = Mix(g_theme.bg, g_theme.green, 0.16);
+}
 
 // ------------------------------------------------------------------ globals
 
@@ -59,14 +148,19 @@ static bool      g_panelVisible = false;
 static bool      g_startupOn = false;
 static std::wstring g_lastTip;
 static HFONT     g_fCaption;
-static HFONT     g_fBig;
+static HFONT     g_fStatus;
 static HFONT     g_fBody;
 static HFONT     g_fSmall;
 static int       g_dpi = 96;
 static RECT      g_panelRect = {0, 0, 0, 0};
+static bool      g_panelPlaced = false;
 static HHOOK     g_kbHook = nullptr;
 static DWORD     g_lastDChord = 0;
-static bool      g_panelPlaced = false;
+static bool      g_dwmRounded = false;
+static wchar_t   g_textFace[LF_FACESIZE] = L"Segoe UI";
+static wchar_t   g_displayFace[LF_FACESIZE] = L"Segoe UI";
+
+static int S(int px) { return MulDiv(px, g_dpi, 96); }
 
 // Optional debug log: set DEEPPEAK_DEBUG=1 to write %TEMP%\DeepPeak.log
 static void LogDebug(const wchar_t* msg) {
@@ -79,7 +173,6 @@ static void LogDebug(const wchar_t* msg) {
     fwprintf(f, L"%s\n", msg);
     fclose(f);
 }
-static int S(int px) { return MulDiv(px, g_dpi, 96); }
 
 // -------------------------------------------------------------- peak logic
 
@@ -114,6 +207,15 @@ static Status ComputeStatus() {
     return s;
 }
 
+// UTC epoch of the next moment the peak price applies.
+static time_t NextPeakStart() {
+    const time_t now = time(nullptr);
+    time_t t = now - (now % 60) + 60;
+    const time_t limit = now + 8 * 86400;
+    while (t < limit && !IsPeak(t)) t += 60;
+    return t;
+}
+
 // -------------------------------------------------------------- formatting
 
 static std::wstring FormatDuration(int sec) {
@@ -145,11 +247,27 @@ static std::wstring LocalWhen(time_t t) {
     return std::wstring(kDays[b.tm_wday]) + L" " + LocalClock(t);
 }
 
-// Peak schedule rendered in the user's current local time (handles DST).
-static std::wstring LocalSchedule() {
+// Current UTC offset of this machine, e.g. "UTC+2" or "UTC+5:30".
+static std::wstring UtcOffsetLabel() {
     const time_t now = time(nullptr);
+    struct tm l, g;
+    if (localtime_s(&l, &now) != 0 || gmtime_s(&g, &now) != 0) return L"";
+    int diffMin = (l.tm_hour * 60 + l.tm_min) - (g.tm_hour * 60 + g.tm_min);
+    if (diffMin > 720) diffMin -= 1440;
+    if (diffMin < -720) diffMin += 1440;
+    const int h = diffMin / 60;
+    const int m = diffMin % 60;
+    wchar_t buf[32];
+    if (m == 0)      swprintf_s(buf, L"UTC%+d", h);
+    else             swprintf_s(buf, L"UTC%+d:%02d", h, m < 0 ? -m : m);
+    return buf;
+}
+
+// Peak schedule rendered in local time for the day of the next peak window.
+static std::wstring LocalSchedule() {
     struct tm g;
-    if (gmtime_s(&g, &now) != 0) return L"";
+    const time_t nextPeak = NextPeakStart();
+    if (gmtime_s(&g, &nextPeak) != 0) return L"";
     g.tm_hour = 0; g.tm_min = 0; g.tm_sec = 0;
     const time_t midnight = _mkgmtime(&g);
 
@@ -157,10 +275,47 @@ static std::wstring LocalSchedule() {
     const std::wstring a2 = LocalClock(midnight + kPeak1End * 60);
     const std::wstring b1 = LocalClock(midnight + kPeak2Start * 60);
     const std::wstring b2 = LocalClock(midnight + kPeak2End * 60);
-    return L"Peak Mon-Fri " + a1 + L"-" + a2 + L", " + b1 + L"-" + b2;
+    return L"Peak " + a1 + L"-" + a2 + L", " + b1 + L"-" + b2;
 }
 
 // --------------------------------------------------------------- resources
+
+static int CALLBACK FontEnumProc(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) {
+    *reinterpret_cast<bool*>(p) = true;
+    return 0;
+}
+
+static bool FontExists(const wchar_t* name) {
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    LOGFONTW lf = {};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(lf.lfFaceName, name, _TRUNCATE);
+    bool found = false;
+    EnumFontFamiliesExW(dc, &lf, FontEnumProc, reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
+
+static void PickFonts() {
+    // Windows 11 ships Segoe UI Variable; older systems fall back to Segoe UI.
+    if (FontExists(L"Segoe UI Variable Text")) {
+        wcscpy_s(g_textFace, L"Segoe UI Variable Text");
+    } else {
+        wcscpy_s(g_textFace, L"Segoe UI");
+    }
+    if (FontExists(L"Segoe UI Variable Display")) {
+        wcscpy_s(g_displayFace, L"Segoe UI Variable Display");
+    } else {
+        wcscpy_s(g_displayFace, g_textFace);
+    }
+}
+
+static HFONT MakeFont(const wchar_t* face, int px, int weight) {
+    return CreateFontW(-S(px), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+}
 
 // Draws an anti-aliased filled circle into a 32-bit icon with an alpha channel.
 static HICON MakeDotIcon(int size, COLORREF c) {
@@ -190,8 +345,7 @@ static HICON MakeDotIcon(int size, COLORREF c) {
     }
 
     BYTE* px = static_cast<BYTE*>(bits);
-    const double cx = size / 2.0;
-    const double cy = size / 2.0;
+    const double cx = size / 2.0, cy = size / 2.0;
     const double radius = size * 0.45;
     const double r2 = radius * radius;
 
@@ -201,16 +355,14 @@ static HICON MakeDotIcon(int size, COLORREF c) {
             const double dy = y + 0.5 - cy;
             const double d2 = dx * dx + dy * dy;
 
-            // 1px soft edge for anti-aliasing
             double coverage = 1.0;
             if (d2 > r2) {
-                const double d = d2 > 0.0 ? (d2 - r2) : 0.0;
-                coverage = 1.0 - d / (radius * 2.0);
+                const double over = d2 - r2;
+                coverage = 1.0 - over / (radius * 2.0);
             }
             if (coverage < 0.0) coverage = 0.0;
 
             const BYTE a = static_cast<BYTE>(coverage * 255.0 + 0.5);
-
             BYTE* p = px + (y * size + x) * 4;
             // premultiplied BGRA, which is what CreateIconIndirect expects
             p[0] = static_cast<BYTE>(GetBValue(c) * a / 255);
@@ -233,35 +385,37 @@ static HICON MakeDotIcon(int size, COLORREF c) {
     return icon;
 }
 
+static void RebuildIcons() {
+    HICON peak = MakeDotIcon(32, g_theme.red);
+    HICON off  = MakeDotIcon(32, g_theme.green);
+    if (peak) { if (g_iconPeak) DestroyIcon(g_iconPeak); g_iconPeak = peak; }
+    if (off)  { if (g_iconOff)  DestroyIcon(g_iconOff);  g_iconOff = off; }
+}
+
 static void CreateFonts() {
-    const wchar_t* face = L"Segoe UI";
-    g_fCaption = CreateFontW(-S(9), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
-    g_fBig     = CreateFontW(-S(23), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
-    g_fBody    = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
-    g_fSmall   = CreateFontW(-S(9), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+    if (g_fCaption) DeleteObject(g_fCaption);
+    if (g_fStatus)  DeleteObject(g_fStatus);
+    if (g_fBody)    DeleteObject(g_fBody);
+    if (g_fSmall)   DeleteObject(g_fSmall);
+    g_fCaption = MakeFont(g_textFace, 12, FW_SEMIBOLD);
+    g_fStatus  = MakeFont(g_displayFace, 22, FW_SEMIBOLD);
+    g_fBody    = MakeFont(g_textFace, 14, FW_NORMAL);
+    g_fSmall   = MakeFont(g_textFace, 12, FW_NORMAL);
 }
 
 static void DestroyFonts() {
-    if (g_fCaption) DeleteObject(g_fCaption);
-    if (g_fBig)     DeleteObject(g_fBig);
-    if (g_fBody)    DeleteObject(g_fBody);
-    if (g_fSmall)   DeleteObject(g_fSmall);
+    if (g_fCaption) { DeleteObject(g_fCaption); g_fCaption = nullptr; }
+    if (g_fStatus)  { DeleteObject(g_fStatus);  g_fStatus = nullptr; }
+    if (g_fBody)    { DeleteObject(g_fBody);    g_fBody = nullptr; }
+    if (g_fSmall)   { DeleteObject(g_fSmall);   g_fSmall = nullptr; }
 }
 
 // ------------------------------------------------------------------ tray
 
 static std::wstring BuildTip(const Status& s) {
     std::wstring text = s.peak
-        ? L"DeepPeak - PEAK 2x - expensive for " + FormatDuration(s.secondsLeft)
-        : L"DeepPeak - OFF-PEAK 1x - cheap for " + FormatDuration(s.secondsLeft);
+        ? L"DeepPeak - Peak 2x - expensive for " + FormatDuration(s.secondsLeft)
+        : L"DeepPeak - Off-peak 1x - cheap for " + FormatDuration(s.secondsLeft);
     if (text.size() > 120) text.resize(120);
     return text;
 }
@@ -337,6 +491,24 @@ static void SetStartup(bool on) {
     RegCloseKey(key);
 }
 
+// ------------------------------------------------------------- dwm / theme
+
+static void ApplyDwmTheme(HWND hwnd) {
+    const BOOL dark = g_theme.dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+
+    int pref = DWMWCP_ROUND;
+    const HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                                             &pref, sizeof(pref));
+    g_dwmRounded = SUCCEEDED(hr);
+    if (!g_dwmRounded) {
+        // Windows 10 fallback: clip the window ourselves.
+        HRGN region = CreateRoundRectRgn(0, 0, S(kPanelW) + 1, S(kPanelH) + 1,
+                                         S(16), S(16));
+        SetWindowRgn(hwnd, region, TRUE);
+    }
+}
+
 // ------------------------------------------------------------------ drawing
 
 static void FillRoundRect(HDC dc, const RECT& r, int radius, COLORREF color) {
@@ -358,15 +530,16 @@ static void DrawTextIn(HDC dc, const std::wstring& text, RECT r, HFONT font,
 }
 
 // 24h strip: one slot per half hour, green = cheap, red = peak.
-static void DrawTimeline(HDC dc, const RECT& bar, time_t now) {
+static void DrawTimeline(HDC dc, const RECT& bar, time_t now, COLORREF cheap,
+                         COLORREF peak) {
     const int kSlots = 48;
     const int kSlotSecs = 1800;
 
     HRGN clip = CreateRoundRectRgn(bar.left, bar.top, bar.right + 1, bar.bottom + 1,
                                    bar.bottom - bar.top, bar.bottom - bar.top);
     SelectClipRgn(dc, clip);
-    HBRUSH cheap = CreateSolidBrush(RGB(0x2E, 0x6D, 0x53));
-    HBRUSH peak = CreateSolidBrush(RGB(0x78, 0x32, 0x38));
+    HBRUSH cheapBrush = CreateSolidBrush(cheap);
+    HBRUSH peakBrush = CreateSolidBrush(peak);
     const double step = (bar.right - bar.left) / static_cast<double>(kSlots);
     for (int i = 0; i < kSlots; ++i) {
         RECT seg;
@@ -374,10 +547,10 @@ static void DrawTimeline(HDC dc, const RECT& bar, time_t now) {
         seg.right = bar.left + static_cast<LONG>((i + 1) * step) + 1;
         seg.top = bar.top;
         seg.bottom = bar.bottom;
-        FillRect(dc, &seg, IsPeak(now + i * kSlotSecs) ? peak : cheap);
+        FillRect(dc, &seg, IsPeak(now + i * kSlotSecs) ? peakBrush : cheapBrush);
     }
-    DeleteObject(cheap);
-    DeleteObject(peak);
+    DeleteObject(cheapBrush);
+    DeleteObject(peakBrush);
     SelectClipRgn(dc, nullptr);
     DeleteObject(clip);
 }
@@ -395,18 +568,25 @@ static void PaintPanel(HWND hwnd) {
     HGDIOBJ oldBitmap = SelectObject(mem, back);
 
     const Status st = ComputeStatus();
-    const COLORREF accent = st.peak ? kRed : kGreen;
+    const Theme& th = g_theme;
+    const COLORREF accent = st.peak ? th.red : th.green;
 
-    FillRoundRect(mem, rc, S(14), kBorder);
-    RECT inner = {S(1), S(1), w - S(1), h - S(1)};
-    FillRoundRect(mem, inner, S(13), kBg);
+    // Windows 11 flyout surface
+    HBRUSH bgBrush = CreateSolidBrush(th.bg);
+    FillRect(mem, &rc, bgBrush);
+    DeleteObject(bgBrush);
+    {
+        HBRUSH border = CreateSolidBrush(th.border);
+        FrameRect(mem, &rc, border);
+        DeleteObject(border);
+    }
 
     const int pad = S(18);
     const int right = w - pad;
 
     // Header
-    RECT header = {pad, S(14), right - S(52), S(30)};
-    DrawTextIn(mem, L"DEEPSEEK V4.1 FLASH", header, g_fCaption, kMuted,
+    RECT header = {pad, S(15), right - S(54), S(33)};
+    DrawTextIn(mem, L"DeepSeek V4.1 Flash", header, g_fCaption, th.secondary,
                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     // Cost chip
@@ -414,57 +594,61 @@ static void PaintPanel(HWND hwnd) {
     SelectObject(mem, g_fCaption);
     SIZE chipSize = {0, 0};
     GetTextExtentPoint32W(mem, chip.c_str(), static_cast<int>(chip.size()), &chipSize);
-    const int chipW = chipSize.cx + S(20);
-    const int chipH = S(19);
-    RECT chipRc = {right - chipW, S(11), right, S(11) + chipH};
-    FillRoundRect(mem, chipRc, S(9),
-                  st.peak ? RGB(0x3C, 0x22, 0x26) : RGB(0x18, 0x3A, 0x30));
+    const int chipW = chipSize.cx + S(22);
+    const int chipH = S(22);
+    RECT chipRc = {right - chipW, S(13), right, S(13) + chipH};
+    FillRoundRect(mem, chipRc, S(11), st.peak ? th.chipPeakBg : th.chipOffBg);
     DrawTextIn(mem, chip, chipRc, g_fCaption, accent,
                DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
     // Status
-    RECT statusRc = {pad, S(32), right, S(66)};
-    DrawTextIn(mem, st.peak ? L"PEAK" : L"OFF-PEAK", statusRc, g_fBig, accent,
+    RECT statusRc = {pad, S(40), right, S(72)};
+    DrawTextIn(mem, st.peak ? L"Peak" : L"Off-peak", statusRc, g_fStatus, accent,
                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     // Time left in this price tier
     const std::wstring head = st.peak
         ? L"Expensive for " + FormatDuration(st.secondsLeft)
         : L"Cheap for " + FormatDuration(st.secondsLeft);
-    RECT leftRc = {pad, S(66), right, S(86)};
-    DrawTextIn(mem, head, leftRc, g_fBody, kText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    RECT leftRc = {pad, S(74), right, S(96)};
+    DrawTextIn(mem, head, leftRc, g_fBody, th.text, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     // What happens next
     const std::wstring nextLine = st.peak
         ? L"Cheap price returns " + LocalWhen(st.next)
         : L"Peak price starts " + LocalWhen(st.next);
-    RECT nextRc = {pad, S(86), right, S(102)};
-    DrawTextIn(mem, nextLine, nextRc, g_fSmall, kMuted,
+    RECT nextRc = {pad, S(96), right, S(114)};
+    DrawTextIn(mem, nextLine, nextRc, g_fSmall, th.secondary,
                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     // 24h timeline
-    RECT bar = {pad, S(108), right, S(116)};
-    DrawTimeline(mem, bar, time(nullptr));
-    RECT lblL = {pad, S(114), pad + S(40), S(128)};
-    DrawTextIn(mem, L"now", lblL, g_fSmall, RGB(0x64, 0x6C, 0x7B),
+    RECT bar = {pad, S(122), right, S(130)};
+    const COLORREF cheapBar = Mix(th.bg, th.green, 0.85);
+    const COLORREF peakBar = th.dark ? Mix(th.bg, RGB(0xB8, 0x4A, 0x52), 0.95)
+                                     : Mix(th.bg, th.red, 0.85);
+    DrawTimeline(mem, bar, time(nullptr), cheapBar, peakBar);
+    RECT lblL = {pad, S(130), pad + S(60), S(144)};
+    DrawTextIn(mem, L"now", lblL, g_fSmall, th.tertiary,
                DT_LEFT | DT_SINGLELINE | DT_TOP);
-    RECT lblR = {right - S(40), S(114), right, S(128)};
-    DrawTextIn(mem, L"+24h", lblR, g_fSmall, RGB(0x64, 0x6C, 0x7B),
+    RECT lblR = {right - S(60), S(130), right, S(144)};
+    DrawTextIn(mem, L"+24h", lblR, g_fSmall, th.tertiary,
                DT_RIGHT | DT_SINGLELINE | DT_TOP);
 
     // Divider
-    RECT div = {pad, S(132), right, S(133)};
-    HBRUSH divBr = CreateSolidBrush(RGB(0x24, 0x28, 0x31));
+    RECT div = {pad, S(150), right, S(151)};
+    HBRUSH divBr = CreateSolidBrush(th.divider);
     FillRect(mem, &div, divBr);
     DeleteObject(divBr);
 
     // Footer
-    RECT f1 = {pad, S(138), right, S(154)};
-    DrawTextIn(mem, LocalSchedule(), f1, g_fSmall, kMuted,
+    RECT f1 = {pad, S(156), right, S(174)};
+    DrawTextIn(mem, LocalSchedule(), f1, g_fSmall, th.secondary,
                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    RECT f2 = {pad, S(152), right, S(168)};
-    DrawTextIn(mem, L"Local time - weekends are always off-peak", f2, g_fSmall,
-               RGB(0x64, 0x6C, 0x7B), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    const std::wstring f2 = L"Local time " + UtcOffsetLabel() + L" - weekends off-peak";
+    RECT f2r = {pad, S(172), right, S(188)};
+    DrawTextIn(mem, f2, f2r, g_fSmall, th.tertiary,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBitmap);
@@ -508,12 +692,15 @@ static void ShowPanel(bool show) {
 
 static void CopyStatusToClipboard() {
     const Status st = ComputeStatus();
-    std::wstring text = st.peak ? L"PEAK" : L"OFF-PEAK";
+    std::wstring text = st.peak ? L"Peak" : L"Off-peak";
     text += st.peak ? L" (2x cost)" : L" (1x cost)";
     text += st.peak ? L", peak ends " : L", peak starts ";
     text += LocalWhen(st.next);
     text += L" local. ";
     text += LocalSchedule();
+    text += L" (";
+    text += UtcOffsetLabel();
+    text += L")";
 
     if (!OpenClipboard(g_hwnd)) return;
     EmptyClipboard();
@@ -562,6 +749,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lPa
     }
     return CallNextHookEx(g_kbHook, code, wParam, lParam);
 }
+
 static void ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kMenuToggle,
@@ -618,13 +806,27 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             if (wParam == kTimerId) UpdateTray(false);
             return 0;
 
+        case WM_SETTINGCHANGE: {
+            LogDebug(L"WM_SETTINGCHANGE");
+            const bool wasDark = g_theme.dark;
+            LoadTheme();
+            LogDebug(g_theme.dark ? L"theme now dark" : L"theme now light");
+            if (wasDark != g_theme.dark) {
+                RebuildIcons();
+                CreateFonts();
+                ApplyDwmTheme(hwnd);
+                UpdateTray(true);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
         case WM_TIMECHANGE:
         case WM_DISPLAYCHANGE:
             UpdateTray(true);
             return 0;
 
         case WM_TOGGLE:
-            LogDebug(L"toggle message");
             ShowPanel(!g_panelVisible);
             return 0;
 
@@ -689,15 +891,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"DeepPeak.SingleInstance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
-    g_iconPeak = MakeDotIcon(32, kRed);
-    g_iconOff  = MakeDotIcon(32, kGreen);
+    LoadTheme();
+    PickFonts();
+    g_iconPeak = MakeDotIcon(32, g_theme.red);
+    g_iconOff  = MakeDotIcon(32, g_theme.green);
     g_peak = ComputeStatus().peak;
 
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.lpszClassName = kAppName;
-    wc.hIcon = g_iconOff;
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    if (!wc.hIcon) wc.hIcon = g_iconOff;
+    wc.hIconSm = wc.hIcon;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
 
@@ -707,10 +913,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     pc.lpszClassName = kClassPanel;
     pc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     pc.hbrBackground = nullptr;
+    pc.style = CS_DROPSHADOW;
     RegisterClassExW(&pc);
 
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kClassPanel, kAppName,
-                             WS_POPUP, 0, 0, 340, 180, nullptr, nullptr, inst, nullptr);
+                             WS_POPUP, 0, 0, kPanelW, kPanelH,
+                             nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
 
     // Scale the panel to the current DPI.
@@ -720,11 +928,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
             g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
             ReleaseDC(g_hwnd, dc);
         }
-        SetWindowPos(g_hwnd, nullptr, 0, 0, S(340), S(180),
+        SetWindowPos(g_hwnd, nullptr, 0, 0, S(kPanelW), S(kPanelH),
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        HRGN region = CreateRoundRectRgn(0, 0, S(340) + 1, S(180) + 1, S(28), S(28));
-        SetWindowRgn(g_hwnd, region, TRUE);
     }
+    ApplyDwmTheme(g_hwnd);
 
     AddTrayIcon();
 
