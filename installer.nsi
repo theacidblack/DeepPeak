@@ -10,7 +10,7 @@ SetCompressorDictSize 32
 !include "FileFunc.nsh"
 
 !ifndef VERSION
-  !define VERSION "1.0.1"
+  !define VERSION "1.0.0"
 !endif
 
 !define APPNAME    "DeepPeak"

@@ -34,6 +34,7 @@ static const wchar_t kPersonalize[] =
 static const UINT WM_TRAYICON = WM_APP + 1;
 static const UINT WM_TOGGLE   = WM_APP + 2;
 static const UINT_PTR kTimerId = 1;
+static const UINT_PTR kPopupTimerId = 2;
 
 static const int kPanelW = 340;
 static const int kPanelH = 196;
@@ -160,7 +161,6 @@ static HFONT     g_fBody;
 static HFONT     g_fSmall;
 static int       g_dpi = 96;
 static RECT      g_panelRect = {0, 0, 0, 0};
-static bool      g_panelPlaced = false;
 static HHOOK     g_kbHook = nullptr;
 static DWORD     g_lastDChord = 0;
 static bool      g_dwmRounded = false;
@@ -495,6 +495,8 @@ static void PlayNotification(bool peak) {
 
 // Fires once per price change while the app is running. A long gap between
 // ticks (sleep, hibernate) only updates the state without playing a stale cue.
+static void PopupPanel();   // defined with the panel code below
+
 static void CheckPriceTransition() {
     const ULONGLONG nowMs = GetTickCount64();
     const bool resumed = (g_lastTickMs != 0) && (nowMs - g_lastTickMs > 15000);
@@ -504,7 +506,10 @@ static void CheckPriceTransition() {
     if (s.peak == g_lastPeakState) return;
 
     g_lastPeakState = s.peak;
-    if (!resumed) PlayNotification(s.peak);
+    if (!resumed) {
+        PlayNotification(s.peak);
+        PopupPanel();
+    }
 }
 // ---------------------------------------------------------------- self test
 // `--selftest` verifies the price windows against an independent reference
@@ -915,24 +920,24 @@ static void PaintPanel(HWND hwnd) {
 
 // ------------------------------------------------------------------- panel
 
+// Every open puts the panel in the bottom-right corner of the primary monitor,
+// just above the taskbar. Always. No saved position, no "wherever the mouse
+// was", which is how it used to end up on a random monitor.
+static void PlacePanelCorner() {
+    RECT wr;
+    GetWindowRect(g_hwnd, &wr);
+    const int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi))
+        return;
+    const int x = mi.rcWork.right - w - S(16);
+    const int y = mi.rcWork.bottom - h - S(16);
+    g_panelRect = {x, y, x + w, y + h};
+}
+
 static void ShowPanel(bool show) {
     if (show) {
-        if (!g_panelPlaced) {
-            POINT pt;
-            GetCursorPos(&pt);
-            MONITORINFO mi = {sizeof(mi)};
-            HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            GetMonitorInfoW(mon, &mi);
-            RECT wr;
-            GetWindowRect(g_hwnd, &wr);
-            const int w = wr.right - wr.left, h = wr.bottom - wr.top;
-            int x = pt.x + S(8);
-            int y = pt.y - h - S(8);
-            if (x + w > mi.rcWork.right) x = mi.rcWork.right - w - S(8);
-            if (y < mi.rcWork.top) y = mi.rcWork.top + S(8);
-            g_panelRect = {x, y, x + w, y + h};
-            g_panelPlaced = true;
-        }
+        PlacePanelCorner();
         SetWindowPos(g_hwnd, HWND_TOPMOST,
                      g_panelRect.left, g_panelRect.top,
                      g_panelRect.right - g_panelRect.left,
@@ -941,9 +946,24 @@ static void ShowPanel(bool show) {
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
         InvalidateRect(g_hwnd, nullptr, FALSE);
     } else {
+        g_closeHover = false;   // no stale hover highlight on the next open
         ShowWindow(g_hwnd, SW_HIDE);
     }
     g_panelVisible = show;
+}
+
+// Price switch: show the panel for a few seconds, then take it away again.
+// Leaves it alone if the user already has it open.
+static void PopupPanel() {
+    if (g_panelVisible) return;
+    LogDebug(L"popup: shown");
+    ShowPanel(true);
+    SetTimer(g_hwnd, kPopupTimerId, 10000, nullptr);
+}
+
+// An open or close the user asked for cancels the automatic popup hide.
+static void CancelPopupTimer() {
+    KillTimer(g_hwnd, kPopupTimerId);
 }
 
 static void CopyStatusToClipboard() {
@@ -1027,7 +1047,7 @@ static void ShowTrayMenu() {
     DestroyMenu(menu);
 
     switch (cmd) {
-        case kMenuToggle:  ShowPanel(!g_panelVisible); break;
+        case kMenuToggle:  CancelPopupTimer(); ShowPanel(!g_panelVisible); break;
         case kMenuCopy:    CopyStatusToClipboard();    break;
         case kMenuStartup: SetStartup(!g_startupOn);   break;
         case kMenuSound:
@@ -1109,8 +1129,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             RECT cr = CloseButtonRect(rc.right);
             POINT pt = {x, y};
             if (PtInRect(&cr, pt)) {
-                LogDebug(L"close button: quitting");
-                DestroyWindow(hwnd);
+                // Close the panel only. The app keeps running in the tray.
+                g_closeHover = false;
+                ShowPanel(false);
             }
             return 0;
         }
@@ -1128,6 +1149,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             if (wParam == kTimerId) {
                 CheckPriceTransition();
                 UpdateTray(false);
+            } else if (wParam == kPopupTimerId) {
+                KillTimer(hwnd, kPopupTimerId);
+                LogDebug(L"popup: hiding");
+                if (g_panelVisible) ShowPanel(false);
             }
             return 0;
 
@@ -1147,7 +1172,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         }
 
         case WM_TIMECHANGE:
+            UpdateTray(true);
+            return 0;
+
         case WM_DISPLAYCHANGE:
+            if (g_panelVisible) ShowPanel(true);   // re-clamp to the new layout
             UpdateTray(true);
             return 0;
 
@@ -1156,11 +1185,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             return 0;
 
         case WM_TOGGLE:
+            CancelPopupTimer();
             ShowPanel(!g_panelVisible);
             return 0;
 
         case WM_TRAYICON:
             if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+                CancelPopupTimer();
                 ShowPanel(!g_panelVisible);
             } else if (lParam == WM_RBUTTONUP) {
                 if (g_panelVisible) ShowPanel(false);
@@ -1254,6 +1285,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
     ApplyDwmTheme(g_hwnd);
 
+    // Restore the panel position from last time, if it is still usable.
+
     AddTrayIcon();
 
     // The one-second tick that keeps tray text, icon colour, the panel countdown
@@ -1268,6 +1301,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     // `--show` opens the panel immediately (handy for testing / shortcuts).
     if (cmdLine && wcsstr(cmdLine, L"--show")) ShowPanel(true);
     if (cmdLine && wcsstr(cmdLine, L"--test-sound")) PlayNotification(ComputeStatus().peak);
+    if (cmdLine && wcsstr(cmdLine, L"--test-popup")) { ShowPanel(true); SetTimer(g_hwnd, kPopupTimerId, 10000, nullptr); }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
