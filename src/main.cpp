@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <dwmapi.h>
+#include <mmsystem.h>
 #include <ctime>
 #include <cstdio>
 #include <string>
@@ -20,6 +21,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "winmm.lib")
 
 // ---------------------------------------------------------------- constants
 
@@ -40,7 +42,9 @@ enum MenuId {
     kMenuToggle  = 1001,
     kMenuStartup = 1002,
     kMenuCopy    = 1003,
-    kMenuExit    = 1004
+    kMenuExit    = 1004,
+    kMenuSound   = 1005,
+    kMenuTest    = 1006
 };
 
 // Peak windows, minutes after UTC midnight
@@ -157,6 +161,11 @@ static bool      g_panelPlaced = false;
 static HHOOK     g_kbHook = nullptr;
 static DWORD     g_lastDChord = 0;
 static bool      g_dwmRounded = false;
+static bool      g_soundOn = true;
+static bool      g_lastPeakState = false;
+static ULONGLONG g_lastTickMs = 0;
+static const wchar_t kSoundAlias[] = L"dpNotify";
+static const wchar_t kSettingsKey[] = L"Software\\DeepPeak";
 static wchar_t   g_textFace[LF_FACESIZE] = L"Segoe UI";
 static wchar_t   g_displayFace[LF_FACESIZE] = L"Segoe UI";
 
@@ -410,6 +419,88 @@ static void DestroyFonts() {
     if (g_fSmall)   { DeleteObject(g_fSmall);   g_fSmall = nullptr; }
 }
 
+static std::wstring ExePath();
+
+// ------------------------------------------------------------- notification
+// Two short voice clips next to the exe: sounds\peak.mp3 and sounds\offpeak.mp3.
+// Playback goes through MCI (DirectShow), so no third-party decoder is needed.
+
+static bool LoadSoundSetting() {
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return true;
+    DWORD value = 1, bytes = sizeof(value), type = 0;
+    bool on = true;
+    if (RegQueryValueExW(key, L"SoundNotifications", nullptr, &type,
+                         reinterpret_cast<LPBYTE>(&value), &bytes) == ERROR_SUCCESS) {
+        on = (value != 0);
+    }
+    RegCloseKey(key);
+    return on;
+}
+
+static void SaveSoundSetting(bool on) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    const DWORD value = on ? 1 : 0;
+    RegSetValueExW(key, L"SoundNotifications", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+}
+
+static std::wstring ExeDir() {
+    std::wstring path = ExePath();
+    const size_t slash = path.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? std::wstring() : path.substr(0, slash + 1);
+}
+
+static std::wstring SoundPath(bool peak) {
+    const std::wstring name = peak ? L"peak.mp3" : L"offpeak.mp3";
+    const std::wstring withFolder = ExeDir() + L"sounds\\" + name;
+    if (GetFileAttributesW(withFolder.c_str()) != INVALID_FILE_ATTRIBUTES) return withFolder;
+    return ExeDir() + name;
+}
+
+static void StopNotification() {
+    std::wstring cmd = std::wstring(L"close ") + kSoundAlias;
+    mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+}
+
+static void PlayNotification(bool peak) {
+    if (!g_soundOn) return;
+
+    const std::wstring path = SoundPath(peak);
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        LogDebug(L"sound file missing");
+        return;
+    }
+
+    StopNotification();
+    std::wstring open = L"open \"" + path + L"\" type mpegvideo alias " + kSoundAlias;
+    if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) != 0) {
+        LogDebug(L"mci open failed");
+        return;
+    }
+    LogDebug(peak ? L"playing peak.mp3" : L"playing offpeak.mp3");
+    std::wstring play = std::wstring(L"play ") + kSoundAlias + L" notify";
+    mciSendStringW(play.c_str(), nullptr, 0, g_hwnd);
+}
+
+// Fires once per price change while the app is running. A long gap between
+// ticks (sleep, hibernate) only updates the state without playing a stale cue.
+static void CheckPriceTransition() {
+    const ULONGLONG nowMs = GetTickCount64();
+    const bool resumed = (g_lastTickMs != 0) && (nowMs - g_lastTickMs > 15000);
+    g_lastTickMs = nowMs;
+
+    const Status s = ComputeStatus();
+    if (s.peak == g_lastPeakState) return;
+
+    g_lastPeakState = s.peak;
+    if (!resumed) PlayNotification(s.peak);
+}
 // ------------------------------------------------------------------ tray
 
 static std::wstring BuildTip(const Status& s) {
@@ -755,6 +846,9 @@ static void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, kMenuToggle,
                 g_panelVisible ? L"Hide panel\tCtrl+D, P" : L"Show panel\tCtrl+D, P");
     AppendMenuW(menu, MF_STRING, kMenuCopy, L"Copy status");
+    AppendMenuW(menu, MF_STRING | (g_soundOn ? MF_CHECKED : 0), kMenuSound,
+                L"Sound notification");
+    AppendMenuW(menu, MF_STRING, kMenuTest, L"Test sound");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     g_startupOn = StartupEnabled();
     AppendMenuW(menu, MF_STRING | (g_startupOn ? MF_CHECKED : 0), kMenuStartup,
@@ -774,6 +868,12 @@ static void ShowTrayMenu() {
         case kMenuToggle:  ShowPanel(!g_panelVisible); break;
         case kMenuCopy:    CopyStatusToClipboard();    break;
         case kMenuStartup: SetStartup(!g_startupOn);   break;
+        case kMenuSound:
+            g_soundOn = !g_soundOn;
+            SaveSoundSetting(g_soundOn);
+            if (!g_soundOn) StopNotification();
+            break;
+        case kMenuTest:    PlayNotification(ComputeStatus().peak); break;
         case kMenuExit:    DestroyWindow(g_hwnd);      break;
         default: break;
     }
@@ -803,7 +903,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             return 0;
 
         case WM_TIMER:
-            if (wParam == kTimerId) UpdateTray(false);
+            if (wParam == kTimerId) {
+                CheckPriceTransition();
+                UpdateTray(false);
+            }
             return 0;
 
         case WM_SETTINGCHANGE: {
@@ -824,6 +927,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_TIMECHANGE:
         case WM_DISPLAYCHANGE:
             UpdateTray(true);
+            return 0;
+
+        case MM_MCINOTIFY:
+            if (wParam == MCI_NOTIFY_SUCCESSFUL) StopNotification();
             return 0;
 
         case WM_TOGGLE:
@@ -863,6 +970,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_DESTROY: {
             KillTimer(hwnd, kTimerId);
             if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+            StopNotification();
             NOTIFYICONDATAW nid = {};
             nid.cbSize = sizeof(nid);
             nid.hWnd = hwnd;
@@ -896,6 +1004,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_iconPeak = MakeDotIcon(32, g_theme.red);
     g_iconOff  = MakeDotIcon(32, g_theme.green);
     g_peak = ComputeStatus().peak;
+    g_lastPeakState = g_peak;
+    g_soundOn = LoadSoundSetting();
 
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -940,6 +1050,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
 
     // `--show` opens the panel immediately (handy for testing / shortcuts).
     if (cmdLine && wcsstr(cmdLine, L"--show")) ShowPanel(true);
+    if (cmdLine && wcsstr(cmdLine, L"--test-sound")) PlayNotification(ComputeStatus().peak);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

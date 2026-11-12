@@ -45,6 +45,21 @@ so afternoons and evenings are always cheap.
 - DWM rounded corners, drop shadow, per-monitor DPI aware.
 - Costs nothing to run: no runtime, no framework, no network access.
 
+## Voice notification
+
+When the price switches, DeepPeak plays a short voice clip: "cheap" when the
+off-peak window starts and "expensive" when peak starts. Clips live in
+`sounds\` next to the exe (`peak.mp3`, `offpeak.mp3`) and are played through
+Windows MCI, so nothing is bundled into the binary and no codec install is
+needed.
+
+Toggle it in the tray menu: **Sound notification** (checked by default). The
+choice is saved under `HKCU\Software\DeepPeak`. There is also a **Test sound**
+item, and `DeepPeak.exe --test-sound` plays the clip for the current state.
+
+The cue only fires on a real transition while the app is running; waking from
+sleep does not replay a stale sound.
+
 ## Hotkey
 
 Press **Ctrl+D, then P** (hold Ctrl) anywhere in Windows to show or hide the
@@ -61,7 +76,8 @@ anything else.
 - Tray icon: green when off-peak, red when peak, tooltip with the countdown.
 - Panel: current tier, time left in it, what happens next and when (local time),
   plus a 24-hour strip showing the shape of the day.
-- Tray menu: show/hide panel, copy status, start with Windows, exit.
+- Tray menu: show/hide panel, copy status, sound on/off, test sound, start with
+  Windows, exit.
 - Single instance, `--show` flag opens the panel immediately.
 
 ## Build
@@ -116,6 +132,12 @@ Windows is the first target. Planned next:
 - macOS and Linux builds (tray/menu bar equivalents),
 - installers (MSI/MSIX or Inno Setup) and a signed release,
 - desktop notifications when a switch is about to happen.
+
+## Third-party resources
+
+- Voice clips generated with **text-to-speech.online** -
+  <https://www.text-to-speech.online/en/>. Free online TTS used to record the
+  two notification lines.
 
 ## License
 

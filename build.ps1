@@ -23,6 +23,8 @@ try {
     Pop-Location
 }
 
+Copy-Item (Join-Path $root 'sounds') $build -Recurse -Force
+
 $exe = Join-Path $build 'DeepPeak.exe'
 Write-Host ""
 Write-Host "Built: $exe"
