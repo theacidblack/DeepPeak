@@ -1,0 +1,239 @@
+name: build
+
+# Builds the app and the installer on GitHub's own runners, runs the arithmetic
+# self-test, and - when SignPath secrets are present - signs both the app and the
+# installer before attaching them to a release.
+#
+# The live tick test (tools/test-live.ps1) is not run here on purpose: it reads
+# the tray tooltip, and runners have no Explorer shell or notification area.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORG: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      SIGNPATH_APP_CONFIG: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIG }}
+      SIGNPATH_SETUP_CONFIG: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIG }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0-dev' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "version: $v"
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+
+      - name: Build the app
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\build\DeepPeak.exe -ArgumentList '--selftest' -PassThru -Wait
+          Get-Content (Join-Path $env:TEMP 'DeepPeak-selftest.txt')
+          if ($p.ExitCode -ne 0) { throw "selftest failed with exit code $($p.ExitCode)" }
+
+      # ---------------------------------------------------------------- signing
+      # Everything below only runs when SIGNPATH_API_TOKEN exists. Without it the
+      # workflow still produces a working unsigned installer.
+
+      - name: Upload the app for signing
+        if: env.SIGNPATH_TOKEN != ''
+        id: upload-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-app
+          path: build/DeepPeak.exe
+          archive: false
+          retention-days: 1
+
+      - name: Sign the app
+        if: env.SIGNPATH_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ env.SIGNPATH_TOKEN }}
+          organization-id: ${{ env.SIGNPATH_ORG }}
+          project-slug: ${{ env.SIGNPATH_PROJECT }}
+          signing-policy-slug: ${{ env.SIGNPATH_POLICY }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_APP_CONFIG }}
+          github-artifact-id: ${{ steps.upload-app.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-app
+          skip-decompress: true
+
+      - name: Use the signed app
+        if: env.SIGNPATH_TOKEN != ''
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse signed-app
+          Copy-Item -Path signed-app\DeepPeak.exe -Destination build\DeepPeak.exe -Force
+          Get-AuthenticodeSignature build\DeepPeak.exe | Format-List Status, StatusMessage, SignerCertificate
+
+      # -------------------------------------------------------------- installer
+
+      - name: Build the installer
+        shell: pwsh
+        run: .\build-installer.ps1 -Version '${{ steps.version.outputs.version }}'
+
+      - name: Upload the installer for signing
+        if: env.SIGNPATH_TOKEN != ''
+        id: upload-setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: dist/DeepPeak-*-setup.exe
+          archive: false
+          retention-days: 1
+
+      - name: Sign the installer
+        if: env.SIGNPATH_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ env.SIGNPATH_TOKEN }}
+          organization-id: ${{ env.SIGNPATH_ORG }}
+          project-slug: ${{ env.SIGNPATH_PROJECT }}
+          signing-policy-slug: ${{ env.SIGNPATH_POLICY }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_SETUP_CONFIG }}
+          github-artifact-id: ${{ steps.upload-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-setup
+          skip-decompress: true
+
+      - name: Use the signed installer
+        if: env.SIGNPATH_TOKEN != ''
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse signed-setup
+          $signed = Get-ChildItem -Recurse signed-setup -Filter '*setup.exe' | Select-Object -First 1
+          if (-not $signed) { throw 'no signed installer came back' }
+          Copy-Item $signed.FullName "dist\DeepPeak-${{ steps.version.outputs.version }}-setup.exe" -Force
+          Get-AuthenticodeSignature "dist\DeepPeak-${{ steps.version.outputs.version }}-setup.exe" |
+            Format-List Status, StatusMessage, SignerCertificate
+
+      # ----------------------------------------------------------------- output
+
+      - name: Hash and collect
+        id: hash
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter '*setup.exe' | Select-Object -First 1
+          $sha = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash
+          "$sha  $($setup.Name)" | Set-Content dist\SHA256.txt -Encoding ascii
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "setup=$($setup.Name)" >> $env:GITHUB_OUTPUT
+          Get-Content dist\SHA256.txt
+          Write-Host ("size: {0:N0} bytes" -f $setup.Length)
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            dist/*setup.exe
+            dist/SHA256.txt
+          retention-days: 30
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $sha = '${{ steps.hash.outputs.sha }}'
+          $setup = '${{ steps.hash.outputs.setup }}'
+          $signed = if ($env:SIGNPATH_TOKEN -ne '') { 'signed with a SignPath Foundation certificate' } else { 'not code signed, so Windows may show "Windows protected your PC" on first run. That is a trust prompt, not a malware detection.' }
+          @"
+          DeepPeak $v
+
+          A small Windows tray app that shows when DeepSeek V4.1 Flash is billed at peak or off-peak rates, and how long is left in the current tier.
+
+          ## Install
+          Run ``$setup``. Per-user, no admin, no reboot. It lands in ``%LOCALAPPDATA%\Programs\DeepPeak`` and puts a dot in the tray.
+
+          ## What it does
+          - Tray dot: green off-peak, red peak, tooltip with the countdown.
+          - Panel (tray icon, or Ctrl+D then P): current tier, time left, next switch in local time, 24-hour strip.
+          - Panel always opens bottom-right of the main screen.
+          - Panel pops up for ten seconds when the price changes, with a voice clip.
+          - Light and dark themes that follow Windows.
+          - Start with Windows, toggleable.
+
+          Peak windows: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday. Everything else, including the whole weekend, is off-peak. Peak tokens cost 2x.
+
+          ## Uninstall
+          Settings > Apps > DeepPeak, or the Start Menu entry. Removes every file, shortcut and registry value it created. A running copy is closed first.
+
+          ## Verify
+          SHA256 of the installer:
+
+          ``$sha``
+
+          ```powershell
+          Get-FileHash .\$setup -Algorithm SHA256
+          ```
+
+          ## Build provenance
+          Built by the ``build`` workflow from tag ``$env:GITHUB_REF_NAME`` on GitHub's own runners; the app passed the three-year arithmetic self-test. The installer is $signed.
+
+          Windows 10 / 11 only.
+          "@ | Set-Content build\release-notes.md -Encoding utf8
+
+      - name: Upload the release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: build/release-notes.md
+          retention-days: 30
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $setup = Get-ChildItem dist -Filter '*setup.exe' | Select-Object -First 1
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $setup.FullName "dist/SHA256.txt" --clobber
+          } else {
+            gh release create $tag $setup.FullName "dist/SHA256.txt" --title "DeepPeak $($tag.TrimStart('v'))" --notes-file "notes/release-notes.md"
+          }

@@ -170,6 +170,11 @@ Requirements: Visual Studio Build Tools (MSVC + Windows SDK) and NSIS 3.
 
 `build-installer.ps1` also prints the SHA256 of the installer.
 
+Releases are built by CI, not by hand: `.github/workflows/build.yml` builds on
+`windows-latest`, runs the self-test, signs both the app and the installer when a
+SignPath token is configured, and publishes the release on a `v*` tag. Details in
+[docs/signing.md](docs/signing.md).
+
 Layout:
 
 ```
