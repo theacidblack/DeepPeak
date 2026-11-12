@@ -149,6 +149,8 @@ static HICON     g_iconPeak;
 static HICON     g_iconOff;
 static bool      g_peak = false;
 static bool      g_panelVisible = false;
+static bool      g_closeHover = false;
+static bool      g_closeTracking = false;
 static bool      g_startupOn = false;
 static std::wstring g_lastTip;
 static UINT      g_taskbarCreated = 0;
@@ -780,6 +782,12 @@ static void DrawTimeline(HDC dc, const RECT& bar, time_t now, COLORREF cheap,
     DeleteObject(clip);
 }
 
+// Top-right corner of the panel header. Clicking it closes the app.
+static RECT CloseButtonRect(int panelWidth) {
+    RECT r = {panelWidth - S(34), S(9), panelWidth - S(8), S(35)};
+    return r;
+}
+
 static void PaintPanel(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd, &ps);
@@ -809,22 +817,45 @@ static void PaintPanel(HWND hwnd) {
     const int pad = S(18);
     const int right = w - pad;
 
-    // Header
-    RECT header = {pad, S(15), right - S(54), S(33)};
-    DrawTextIn(mem, L"DeepSeek V4.1 Flash", header, g_fCaption, th.secondary,
-               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    // Cost chip
+    // Cost chip, then the header, then the close button.
     const std::wstring chip = st.peak ? L"2x" : L"1x";
     SelectObject(mem, g_fCaption);
     SIZE chipSize = {0, 0};
     GetTextExtentPoint32W(mem, chip.c_str(), static_cast<int>(chip.size()), &chipSize);
     const int chipW = chipSize.cx + S(22);
     const int chipH = S(22);
-    RECT chipRc = {right - chipW, S(13), right, S(13) + chipH};
+    const RECT closeRc = CloseButtonRect(w);
+    RECT chipRc = {closeRc.left - S(8) - chipW, S(13), closeRc.left - S(8), S(13) + chipH};
+
+    // Header
+    RECT header = {pad, S(15), chipRc.left - S(10), S(33)};
+    DrawTextIn(mem, L"DeepSeek V4.1 Flash", header, g_fCaption, th.secondary,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
     FillRoundRect(mem, chipRc, S(11), st.peak ? th.chipPeakBg : th.chipOffBg);
     DrawTextIn(mem, chip, chipRc, g_fCaption, accent,
                DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    // Close button: quits the app, like the X on a normal window.
+    if (g_closeHover) {
+        RECT hover = {closeRc.left + S(2), closeRc.top + S(2),
+                      closeRc.right - S(2), closeRc.bottom - S(2)};
+        FillRoundRect(mem, hover, S(6), th.chipPeakBg);
+    }
+    {
+        const int cx = (closeRc.left + closeRc.right) / 2;
+        const int cy = (closeRc.top + closeRc.bottom) / 2;
+        const int d = S(5);
+        const int pw = S(1) < 1 ? 1 : S(1);
+        HPEN pen = CreatePen(PS_SOLID, pw, g_closeHover ? th.red : th.secondary);
+        HGDIOBJ oldPen = SelectObject(mem, pen);
+        MoveToEx(mem, cx - d, cy - d, nullptr);
+        LineTo(mem, cx + d + 1, cy + d + 1);
+        MoveToEx(mem, cx + d, cy - d, nullptr);
+        LineTo(mem, cx - d - 1, cy + d + 1);
+        SelectObject(mem, oldPen);
+        DeleteObject(pen);
+    }
 
     // Status
     RECT statusRc = {pad, S(40), right, S(72)};
@@ -951,7 +982,6 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lPa
     if (code == HC_ACTION) {
         const KBDLLHOOKSTRUCT* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
         const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-        const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
         const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
                           (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
@@ -959,7 +989,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lPa
 
         if (down && kb->vkCode == 'D' && ctrl) {
             g_lastDChord = GetTickCount();
-        } else if (down && kb->vkCode == 'P' && ctrl) {
+        } else if (down && kb->vkCode == 'P') {
+            // Ctrl+D first, then P; P alone is left to the foreground app.
             const DWORD now = GetTickCount();
             if (g_lastDChord != 0 && now - g_lastDChord <= 800) {
                 g_lastDChord = 0;
@@ -967,9 +998,6 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lPa
                 PostMessage(g_hwnd, WM_TOGGLE, 0, 0);
                 return 1;  // swallow P
             }
-        } else if (up && (kb->vkCode == VK_CONTROL || kb->vkCode == VK_LCONTROL ||
-                          kb->vkCode == VK_RCONTROL)) {
-            g_lastDChord = 0;
         }
     }
     return CallNextHookEx(g_kbHook, code, wParam, lParam);
@@ -1030,8 +1058,62 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_ERASEBKGND:
             return 1;
 
-        case WM_NCHITTEST:
-            return HTCAPTION;
+        case WM_NCHITTEST: {
+            // The close button must receive normal clicks; everything else
+            // behaves like a caption so the panel can be dragged.
+            const int x = static_cast<short>(LOWORD(lParam));
+            const int y = static_cast<short>(HIWORD(lParam));
+            POINT pt = {x, y};
+            ScreenToClient(hwnd, &pt);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            RECT cr = CloseButtonRect(rc.right);
+            return PtInRect(&cr, pt) ? HTCLIENT : HTCAPTION;
+        }
+
+        case WM_MOUSEMOVE: {
+            const int x = static_cast<short>(LOWORD(lParam));
+            const int y = static_cast<short>(HIWORD(lParam));
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            RECT cr = CloseButtonRect(rc.right);
+            POINT pt = {x, y};
+            const bool inside = PtInRect(&cr, pt) != 0;
+            if (inside != g_closeHover) {
+                g_closeHover = inside;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (!g_closeTracking) {
+                TRACKMOUSEEVENT tme = {sizeof(tme)};
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+                g_closeTracking = true;
+            }
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            g_closeTracking = false;
+            if (g_closeHover) {
+                g_closeHover = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+
+        case WM_LBUTTONUP: {
+            const int x = static_cast<short>(LOWORD(lParam));
+            const int y = static_cast<short>(HIWORD(lParam));
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            RECT cr = CloseButtonRect(rc.right);
+            POINT pt = {x, y};
+            if (PtInRect(&cr, pt)) {
+                LogDebug(L"close button: quitting");
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
 
         case WM_ACTIVATE:
             if (LOWORD(wParam) == WA_INACTIVE && g_panelVisible)

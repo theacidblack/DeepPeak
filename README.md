@@ -18,7 +18,7 @@ Working off-peak roughly doubles how far your monthly credits go.
 ## Download and install
 
 1. Open [Releases](https://github.com/theacidblack/DeepPeak/releases).
-2. Download `DeepPeak-1.0.0-setup.exe`.
+2. Download `DeepPeak-1.0.1-setup.exe`.
 3. Run it. No admin rights, no reboot, no dependencies.
 
 It installs per user into `%LOCALAPPDATA%\Programs\DeepPeak`, adds a Start Menu
@@ -28,7 +28,7 @@ app appears in the tray.
 Verify the download if you like:
 
 ```powershell
-Get-FileHash .\DeepPeak-1.0.0-setup.exe -Algorithm SHA256
+Get-FileHash .\DeepPeak-1.0.1-setup.exe -Algorithm SHA256
 ```
 
 The hash is published in the release notes and in `dist\SHA256.txt` next to the
@@ -71,6 +71,8 @@ to 04:00-07:00 and 09:00-13:00 in summer.
 - **Voice notification** when the price switches ("cheap" / "expensive").
   Toggle it in the tray menu; the choice is remembered.
 - **Ctrl+D, then P** anywhere in Windows to show or hide the panel.
+- **X in the panel header** quits the app and removes its tray icon, just like
+  closing a normal window. The tray menu has `Exit` as well.
 - Light and dark themes that follow Windows automatically.
 - Start with Windows, on or off, from the tray menu.
 
@@ -141,6 +143,12 @@ against an independent implementation of the published rule, plus 10,080
 transition checks and 10 boundary cases. `DeepPeak.exe --selftest` reproduces the
 result and exits 0.
 
+The window itself is covered separately by `tools\test-live.ps1`: the tray text
+must advance every minute, and must never go backwards. 1.0.1 exists because
+1.0.0 shipped with no timer at all, so the panel, the icon colour and the voice
+alert were frozen at launch - a bug the mathematics test could not catch and a
+two-minute live test does.
+
 - Per-user install, no elevation prompt.
 - Uninstall while the app is running: the app is asked to quit, then everything
   is removed.
@@ -153,7 +161,7 @@ Requirements: Visual Studio Build Tools (MSVC + Windows SDK) and NSIS 3.
 
 ```powershell
 .\build.ps1                  # app only  -> build\DeepPeak.exe
-.\build-installer.ps1        # app + installer -> dist\DeepPeak-1.0.0-setup.exe
+.\build-installer.ps1        # app + installer -> dist\DeepPeak-1.0.1-setup.exe
 ```
 
 `build-installer.ps1` also prints the SHA256 of the installer.
@@ -179,6 +187,9 @@ tools/              icon generator and screenshot helper
 - `DEEPPEAK_DEBUG=1` writes `%TEMP%\DeepPeak.log` with hook and theme events.
 - `DeepPeak.exe --selftest` runs 1.5M minute checks plus transition and boundary
   tests, writes `%TEMP%\DeepPeak-selftest.txt`, exits 0 on pass.
+- `tools\test-live.ps1` starts the app and samples the tray tooltip for two
+  minutes, failing if the countdown does not move. It catches a dead timer,
+  which the pure-math self-test cannot see.
 - `DeepPeak.exe --test-sound` plays the notification for the current state.
 - `DeepPeak.exe --quit` closes a running copy.
 
