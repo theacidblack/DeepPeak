@@ -136,6 +136,11 @@ for a signature.
 
 ## Verified behaviour
 
+Every minute from 2025-01-01 for three years (1,576,800 minutes) is compared
+against an independent implementation of the published rule, plus 10,080
+transition checks and 10 boundary cases. `DeepPeak.exe --selftest` reproduces the
+result and exits 0.
+
 - Per-user install, no elevation prompt.
 - Uninstall while the app is running: the app is asked to quit, then everything
   is removed.
@@ -172,6 +177,8 @@ tools/              icon generator and screenshot helper
   saves a screenshot to `docs\`.
 - `DEEPPEAK_THEME=light|dark` forces a palette.
 - `DEEPPEAK_DEBUG=1` writes `%TEMP%\DeepPeak.log` with hook and theme events.
+- `DeepPeak.exe --selftest` runs 1.5M minute checks plus transition and boundary
+  tests, writes `%TEMP%\DeepPeak-selftest.txt`, exits 0 on pass.
 - `DeepPeak.exe --test-sound` plays the notification for the current state.
 - `DeepPeak.exe --quit` closes a running copy.
 

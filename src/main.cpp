@@ -200,9 +200,8 @@ static bool IsPeak(time_t t) {
            (m >= kPeak2Start && m < kPeak2End);
 }
 
-static Status ComputeStatus() {
+static Status ComputeStatusAt(time_t now) {
     Status s;
-    const time_t now = time(nullptr);
     s.peak = IsPeak(now);
 
     // Step forward minute-aligned until the state flips (max 8 days).
@@ -216,14 +215,17 @@ static Status ComputeStatus() {
     return s;
 }
 
+static Status ComputeStatus() { return ComputeStatusAt(time(nullptr)); }
+
 // UTC epoch of the next moment the peak price applies.
-static time_t NextPeakStart() {
-    const time_t now = time(nullptr);
+static time_t NextPeakAt(time_t now) {
     time_t t = now - (now % 60) + 60;
     const time_t limit = now + 8 * 86400;
     while (t < limit && !IsPeak(t)) t += 60;
     return t;
 }
+
+static time_t NextPeakStart() { return NextPeakAt(time(nullptr)); }
 
 // -------------------------------------------------------------- formatting
 
@@ -500,6 +502,107 @@ static void CheckPriceTransition() {
 
     g_lastPeakState = s.peak;
     if (!resumed) PlayNotification(s.peak);
+}
+// ---------------------------------------------------------------- self test
+// `--selftest` verifies the price windows against an independent reference
+// implementation and checks every transition. Result goes to %TEMP%.
+static int ReferenceIsPeak(time_t t) {
+    // Deliberately does not use gmtime: epoch arithmetic only.
+    const long long days = static_cast<long long>(t) / 86400;
+    const int wd = static_cast<int>((days + 4) % 7);  // 1970-01-01 was a Thursday
+    const int mins = static_cast<int>((static_cast<long long>(t) % 86400) / 60);
+    if (wd == 0 || wd == 6) return 0;
+    return ((mins >= 60 && mins < 240) || (mins >= 360 && mins < 600)) ? 1 : 0;
+}
+
+static int RunSelfTest() {
+    int failures = 0;
+    int checked = 0;
+    wchar_t line[256] = {};
+
+    const time_t start = 1735689600;              // 2025-01-01 00:00:00 UTC
+    const time_t end = start + 3LL * 365 * 86400; // three years of minutes
+
+    // 1. Every minute must agree with the reference rule.
+    for (time_t t = start; t < end; t += 60) {
+        ++checked;
+        if (IsPeak(t) != (ReferenceIsPeak(t) != 0)) {
+            if (++failures <= 5) {
+                struct tm g;
+                gmtime_s(&g, &t);
+                swprintf_s(line, L"mismatch at %04d-%02d-%02d %02d:%02d",
+                           g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min);
+                LogDebug(line);
+            }
+        }
+    }
+
+    // 2. Every computed transition must be the true first flip.
+    int transitionChecks = 0;
+    for (time_t t = 1767225600; t < 1767225600 + 7 * 86400; t += 60) {
+        const Status s = ComputeStatusAt(t);
+        ++transitionChecks;
+        if (s.next <= t || IsPeak(s.next) == s.peak || s.secondsLeft < 0 || s.secondsLeft > 8 * 86400) {
+            ++failures;
+            continue;
+        }
+        for (time_t m = t - (t % 60); m < s.next; m += 60) {
+            if (IsPeak(m) != s.peak) { ++failures; break; }
+        }
+    }
+
+    // 3. Known boundaries, in UTC (2026-11-09 is a Monday).
+    struct Case { int y, mo, d, h, mi; bool peak; int nextMinutes; };
+    const Case cases[] = {
+        {2026, 11, 9,  0, 59, false, 1},     // Sunday->Monday, off-peak until 01:00
+        {2026, 11, 9,  1,  0, true,  180},   // peak starts
+        {2026, 11, 9,  3, 59, true,  1},
+        {2026, 11, 9,  4,  0, false, 120},
+        {2026, 11, 9,  5, 59, false, 1},
+        {2026, 11, 9,  6,  0, true,  240},
+        {2026, 11, 9,  9, 59, true,  1},
+        {2026, 11, 9, 10,  0, false, 15 * 60},
+        {2026, 11, 13, 10, 0, false, 63 * 60},                     // Friday 10:00 -> Monday 01:00
+        {2026, 11, 14, 12, 0, false, 37 * 60},                  // Saturday noon -> Monday 01:00
+    };
+    int boundaryChecks = 0;
+    for (const Case& c : cases) {
+        struct tm g = {};
+        g.tm_year = c.y - 1900; g.tm_mon = c.mo - 1; g.tm_mday = c.d;
+        g.tm_hour = c.h; g.tm_min = c.mi;
+        const time_t t = _mkgmtime(&g);
+        const Status s = ComputeStatusAt(t);
+        ++boundaryChecks;
+        if (IsPeak(t) != c.peak) ++failures;
+        const int minutes = (int)(s.next - t) / 60;
+        if (minutes != c.nextMinutes) {
+            ++failures;
+            LogDebug(L"boundary case failed");
+            wchar_t detail[160] = {};
+            swprintf_s(detail, L"  case %04d-%02d-%02d %02d:%02d expected %d min, got %d",
+                       c.y, c.mo, c.d, c.h, c.mi, c.nextMinutes, minutes);
+            LogDebug(detail);
+        }
+    }
+
+    // 4. Local display must match the OS conversion for the schedule text.
+    const time_t nextPeak = NextPeakAt(time(nullptr));
+    const bool scheduleOk = !LocalSchedule().empty() && nextPeak > 0;
+
+    wchar_t path[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"DeepPeak-selftest.txt");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") == 0 && f) {
+        fwprintf(f, L"minutes checked      : %d\n", checked);
+        fwprintf(f, L"transition checks    : %d\n", transitionChecks);
+        fwprintf(f, L"boundary checks      : %d\n", boundaryChecks);
+        fwprintf(f, L"schedule text        : %s\n", scheduleOk ? L"ok" : L"empty");
+        fwprintf(f, L"failures             : %d\n", failures);
+        fwprintf(f, L"result               : %s\n", failures == 0 ? L"PASS" : L"FAIL");
+        fclose(f);
+    }
+    return failures == 0 ? 0 : 1;
 }
 // ------------------------------------------------------------------ tray
 
@@ -1008,6 +1111,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         if (running) PostMessageW(running, WM_CLOSE, 0, 0);
         return 0;
     }
+
+    if (cmdLine && wcsstr(cmdLine, L"--selftest")) return RunSelfTest();
 
     // Single instance
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"DeepPeak.SingleInstance");
