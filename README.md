@@ -101,6 +101,10 @@ verify every file and key is gone.
 
 ## SmartScreen and reputation
 
+> **Signing status:** application submitted to **SignPath Foundation** on
+> 2026-11-12, awaiting review. Details and the plan after approval are in
+> [docs/signing.md](docs/signing.md).
+
 An unsigned installer downloaded from the internet will usually trigger
 Microsoft Defender SmartScreen ("Windows protected your PC"). That is not a virus
 warning, it is a trust warning: the file has no known publisher and no download
@@ -119,6 +123,7 @@ What actually removes the warning, in order of cost:
    individuals.
 4. **SignPath Foundation** - free code signing for open source projects. Real
    certificate, OV-level reputation, so the warning fades with downloads.
+   **Applied 2026-11-12, pending review.**
 5. **Microsoft Store / MSIX** distribution. Store-signed packages install with no
    SmartScreen prompt at all, at the cost of Store review and packaging.
 6. **winget** (`winget install DeepPeak`). Not a signature, but it gives users a
